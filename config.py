@@ -191,17 +191,7 @@ MIN_PATCHES_FOR_VOTE = 3      # slide needs >= this many firm patches for Rule 1
 NEIGHBOR_AGREE_MIN   = 3      # Rule 2: neighbors needed to resolve uncertain patch
 CLUSTER_MIN          = 3      # Rule 3: min adjacent minority patches = cluster flag
 
-# Rule 1c/1d — Mixed patch resolution threshold
-# Mixed patches in a dominant slide are resolved to the majority class ONLY when
-# the slide ratio >= this. Set higher than MAJORITY_RATIO_THR to be more
-# conservative about overriding Mixed predictions.
-MIXED_RESOLVE_RATIO_THR = 0.85
-
-# Rule 1c/1d — Maximum allowed Mixed fraction on a slide before Rule 1c is blocked.
-# If more than this fraction of a slide predicts Mixed, treat as genuinely heterogeneous.
-MAX_MIXED_FRACTION_FOR_RESOLVE = 0.20
-
-# Rule 1f — Section (quadrant/window) vote parameters
+# Rule 1a/1b — Section (quadrant/window) vote parameters  ← correct
 N_SECTIONS                  = 4      # 2×2 quadrant grid  (or 9 for 3×3)
 SECTION_MIN_PATCHES         = 2      # min firm patches in a section to be trusted
 SECTION_MAJORITY_RATIO_THR  = 0.75   # section needs >= 75% agreement to be dominant
@@ -213,7 +203,7 @@ SECTION_MINORITY_RATIO_THR    = 0.85
 
 # Rule 0 (Anchor) + Rule 5 (Stronghold)
 # ANCHOR_CONF_THR: patches with confidence >= this are immutable in Rule 1.
-ANCHOR_CONF_THR  = 0.85   # same as HIGH_CONF_THR by default
+ANCHOR_CONF_THR  = HIGH_CONF_THR   # same as HIGH_CONF_THR by default
 
 # STRONGHOLD_MIN: patch with >= this many HIGH-conf same-class neighbours
 # is a "stronghold" and cannot be flipped by Rule 1, even if LOW/MEDIUM conf.
