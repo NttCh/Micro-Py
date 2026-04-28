@@ -277,24 +277,6 @@ def _build_pytrain_cfg():
             "min_fold_score":         0.75,
         },
 
-        "xai": {
-            "enabled":              False,
-            "target_layer":         ["layer2", "layer3", "layer4"],
-            "k_patches":            3,
-            "patch_size":           96,
-            "save_heatmap":         True,
-            "save_overlay":         True,
-            "save_original_overlay": True,
-            "panel":                False,
-            "class_names":          ["Gminus", "Gplus", "mixed"],
-            "tta":                  True,
-            "smooth":               True,
-            "smooth_n":             6,
-            "smooth_sigma":         0.05,
-            "mask_scale_bar":       False,
-            "mask_rect_wh":         [0.18, 0.08],
-        },
-
         "optimizer": {
             "class_name": f"torch.optim.{OPTIMIZER}",
             "params": {
