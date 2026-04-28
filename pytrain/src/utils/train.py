@@ -1,7 +1,6 @@
 #!/usr/bin/env python
+import pytrain.src._path_fix  # noqa: F401  — ensures repo root is on sys.path
 """Training utilities and main training functions."""
-
-from __future__ import annotations
 
 import os
 import time
@@ -452,7 +451,6 @@ def train_stage(
             MasterValidationMetricsCallback(
                 fold_number=0 if fold_number is None else int(fold_number),
                 head_tag="cnn",
-                monitor_metric=monitor_metric,  # BUG FIX: pass primary metric so Excel per_fold_best is correct
             )
         )
 
