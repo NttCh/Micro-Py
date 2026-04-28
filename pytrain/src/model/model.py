@@ -71,7 +71,8 @@ class LitClassifier(pl.LightningModule):
       - 2-class (binary) and 3-class (Gminus / Gplus / mixed)
       - label smoothing (via cfg.training.label_smoothing or explicit arg)
       - class-weighted CrossEntropyLoss (via cfg.training.ce_class_weights)
-      - freeze strategies: "none" | "feature_extractor" | "warmup_unfreeze"
+      - freeze strategies: "initial" | "none"
+      (controlled by FreezeBackboneCallback in train.py, not here)
     """
 
     def __init__(
