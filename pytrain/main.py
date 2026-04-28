@@ -89,8 +89,6 @@ from src.utils.utils import (
 
 from src.utils.viz import export_optuna_plots, _run_cv_plots
 from src.utils.config_logger import save_config_snapshot
-from src.utils.xai import _maybe_run_xai
-
 
 # ---------------- Mode Runners ----------------
 def run_test_only(cfg, dirs):
@@ -138,13 +136,6 @@ def run_test_only(cfg, dirs):
                 ckpt_print_prefix=f"[{ckpt_name}] ",
             )
             ALL_RESULTS_FOR_COMPARE[ckpt_name] = results_dict
-
-            for folder in test_folds:
-                _maybe_run_xai(
-                    model, valid_tf, folder, dirs,
-                    getattr(cfg, "xai", None) or {},
-                    ckpt_tag=ckpt_name,
-                )
 
     if len(ALL_RESULTS_FOR_COMPARE) > 1:
         compare_xlsx = os.path.join(dirs["multi_predictions"], "predictions_COMPARE_ALL_CKPTS.xlsx")
@@ -200,7 +191,6 @@ def run_tune(cfg, dirs):
 
     if getattr(cfg.training, "finalize_after_hpo", False):
         print("[Finalize] Retraining with best CNN hyperparameters on CV...")
-        cfg.use_cv = True
         num_classes = int(getattr(getattr(cfg, "model", {}), "num_classes", 3))
         detection_model, _ = repeated_cross_validation(
             cfg, cfg.data.detection_csv,
