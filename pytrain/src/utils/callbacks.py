@@ -1,7 +1,6 @@
 #!/usr/bin/env python
+import pytrain.src._path_fix  # noqa: F401  — ensures repo root is on sys.path
 """Custom callbacks: progress tracking, evaluation, Excel export, Optuna reporting."""
-
-from __future__ import annotations
 
 import math
 import os
@@ -178,7 +177,7 @@ class MasterValidationMetricsCallback(pl.Callback):
     """
     Write per-epoch metrics to <BASE_SAVE_DIR>/eval/all_eval_metrics_<head_tag>.xlsx:
       - logs (per-epoch, per-fold)
-      - per_fold_best (best epoch by val_f2)
+      - per_fold_best (best epoch by val_mcc)
       - summary (mean ± std and 95% CI across folds, using per-fold best)
       - epoch_mean (mean/std across folds for each epoch, for learning-curve plots)
     """
@@ -210,7 +209,7 @@ class MasterValidationMetricsCallback(pl.Callback):
         row = {"fold": self.fold_number, "epoch": epoch, "head_type": self.head_tag}
 
         for prefix in ["train", "val"]:
-            for m in ["loss", "acc", "precision", "recall", "f1", "f2"]:
+            for m in ["loss", "acc", "precision", "recall", "f1", "f2", "mcc"]:
                 key = f"{prefix}_{m}"
                 val = _tf(key)
                 if val is not None:
@@ -234,18 +233,18 @@ class MasterValidationMetricsCallback(pl.Callback):
         # ensure columns exist (keep your originals + a few common ones)
         must_cols = [
             "fold", "epoch", "head_type",
-            "val_f2", "val_recall", "val_precision", "val_loss", "val_acc",
-            "train_f2", "train_loss",
+            "val_mcc", "val_f2", "val_recall", "val_precision", "val_loss", "val_acc",
+            "train_mcc", "train_f2", "train_loss",
         ]
         for c in must_cols:
             if c not in logs_df.columns:
                 logs_df[c] = np.nan
 
-        # --- per-fold best by val_f2 ---
-        tmp = logs_df.dropna(subset=["val_f2"]).copy()
+        # --- per-fold best by val_mcc ---
+        tmp = logs_df.dropna(subset=["val_mcc"]).copy()
         if "fold" not in tmp.columns:
             tmp["fold"] = 0
-        tmp = tmp.sort_values(["fold", "val_f2", "epoch"], ascending=[True, False, False])
+        tmp = tmp.sort_values(["fold", "val_mcc", "epoch"], ascending=[True, False, False])
         per_fold_best = tmp.groupby("fold", as_index=False).first().sort_values("fold")
 
         # --- summary with t-based 95% CI (fallback z=1.96) ---
@@ -259,7 +258,7 @@ class MasterValidationMetricsCallback(pl.Callback):
         k = int(per_fold_best["fold"].nunique()) if len(per_fold_best) else 0
         tcrit = _tcrit(k - 1)
 
-        metrics = ["val_f2", "val_recall", "val_precision", "val_loss", "val_acc"]
+        metrics = ["val_mcc", "val_f2", "val_recall", "val_precision", "val_loss", "val_acc"]
         summary_rows = []
         for m in metrics:
             vals = per_fold_best[m].astype(float).to_numpy() if m in per_fold_best.columns else np.array([])
@@ -288,8 +287,8 @@ class MasterValidationMetricsCallback(pl.Callback):
         epoch_std = g[metric_cols].std(numeric_only=True, ddof=1)
 
         # number of folds contributing per epoch (based on val_f2 presence if exists else any metric)
-        if "val_f2" in logs_df.columns:
-            n_per_epoch = logs_df.groupby("epoch")["val_f2"].apply(lambda s: int(s.notna().sum())).reset_index(name="n_folds")
+        if "val_mcc" in logs_df.columns:
+            n_per_epoch = logs_df.groupby("epoch")["val_mcc"].apply(lambda s: int(s.notna().sum())).reset_index(name="n_folds")
         else:
             n_per_epoch = logs_df.groupby("epoch").size().reset_index(name="n_folds")
 
