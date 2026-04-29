@@ -20,12 +20,10 @@ Context mode (config.SECTION_MODE):
               centred on that patch. No hard region boundaries.
 
 Rule execution order per patch:
-  Rule 0 (anchor guard) → Rule 5 (stronghold guard) → Rule 1a/1b → Rule 2 → Rule 3 → Rule 4
+  Rule 0 (anchor guard) → Rule 1a/1b → Rule 2 → Rule 3 → Rule 4
 
-Anchor / stronghold guards (applied before Rule 1a/1b):
-  Rule 0: conf >= HIGH_CONF_THR and not Mixed → immutable, skip all rules.
-  Rule 5: >= STRONGHOLD_MIN HIGH-conf same-class 4-neighbours → skip Rule 1a/1b only;
-          Rule 2/3/4 still run on these patches.
+Anchor guard (applied before all rules):
+  Rule 0: conf >= ANCHOR_CONF_THR (= HIGH_CONF_THR) and not Mixed → immutable, skip all rules.
 """
 
 from __future__ import annotations
@@ -353,7 +351,6 @@ def run_pyreason(
 
     Rule execution order per patch:
         Rule 0 (anchor guard)
-        Rule 5 (stronghold guard)      ← skips Rule 1a/1b only; 2/3/4 still run
         Rule 1a (Mixed in dominant context)    → correct to context majority
         Rule 1b (minority firm in dominant context, strict bar) → flip to context majority
         — if Rule 1a or 1b fired, patch is already in corrections dict;
@@ -418,31 +415,7 @@ def run_pyreason(
     r3_count  = 0
     r4_count  = 0
 
-    # ── Stronghold pre-computation ────────────────────────────────
-    # A patch is a stronghold if it has >= STRONGHOLD_MIN 4-connected neighbours
-    # predicting the SAME class with HIGH confidence.
-    # Stronghold patches skip Rule 1a/1b but Rule 2/3/4 still run on them.
-    stronghold_min = getattr(config, "STRONGHOLD_MIN", 2)
-    anchor_conf    = getattr(config, "ANCHOR_CONF_THR", config.HIGH_CONF_THR)
-    strongholds: set = set()
-
-    for n, pred in raw.items():
-        if pred["conf_tier"] != "HIGH":
-            continue
-        cls = pred["predicted"]
-        if cls in UNCERTAIN_CLASSES:
-            continue
-        same_class_nbs = [
-            nb for nb in nb_index.get(n, [])
-            if nb in raw
-            and raw[nb]["predicted"] == cls
-            and raw[nb]["conf_tier"] == "HIGH"
-        ]
-        if len(same_class_nbs) >= stronghold_min:
-            strongholds.add(n)
-
-    print(f"  [Anchor] Stronghold patches: {len(strongholds)} "
-          f"(>= {stronghold_min} HIGH-conf same-class neighbours)")
+    anchor_conf = getattr(config, "ANCHOR_CONF_THR", config.HIGH_CONF_THR)
 
     # ── Helper: look up context vote for a patch ──────────────────
     def _ctx_vote(n: str) -> Dict:
@@ -464,9 +437,8 @@ def run_pyreason(
     # Rule 1b — minority firm patch in a dominant context window/quadrant
     #   → flip to context majority     (needs dominant_strict, stricter bar)
     #
-    # Guards applied BEFORE checking context:
+    # Guard applied BEFORE checking context:
     #   Rule 0: conf >= anchor_conf and not Mixed → immutable, skip ALL rules.
-    #   Rule 5: patch in strongholds set          → skip Rule 1a/1b only.
     #
     # If Rule 1a or 1b fires, the patch is added to corrections; Rule 2
     # will skip it via `if n in corrections: continue`.
@@ -483,10 +455,6 @@ def run_pyreason(
 
         if not ctx:
             continue   # no grid position or context unavailable
-
-        # Rule 5: stronghold → skip Rule 1a/1b, but allow Rule 2/3/4
-        if n in strongholds:
-            continue
 
         if not ctx.get("dominant", False):
             continue   # context not reliable enough for Rule 1a/1b
@@ -533,7 +501,6 @@ def run_pyreason(
     #
     # Rule 2 fires on patches that Rule 1 could not help:
     #   - patch in a non-dominant section/window (section too sparse)
-    #   - patch is a stronghold (skipped Rule 1 but still uncertain/LOW)
     #   - patch is the only patch in a slide (standalone)
     # In all these cases, if strong local neighbour consensus exists,
     # Rule 2 can still resolve the patch.
