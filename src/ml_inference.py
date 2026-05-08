@@ -5,6 +5,10 @@ Run the trained model on all images in a folder.
 Returns raw predictions: {image_name: {prob_G, prob_Gplus, predicted, ...}}
 
 No training code. No augmentation beyond resize + normalize.
+
+Confidence tiers (two-tier only):
+  HIGH  — conf >= config.HIGH_CONF_THR   -> anchor-eligible, Rule 2 donor
+  LOW   — conf <  config.HIGH_CONF_THR   -> uncertain; eligible for Rule 1/2/4
 """
 
 import os
@@ -24,9 +28,9 @@ import config
 IMG_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 #  Transform (same as val transform used during training)
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 
 def build_transform(img_size: int = 224) -> A.Compose:
     return A.Compose([
@@ -36,14 +40,14 @@ def build_transform(img_size: int = 224) -> A.Compose:
     ])
 
 
-# ─────────────────────────────────────────────────────────────────
-#  Filename parser  →  (slide_id, is_patch, row, col)
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
+#  Filename parser  ->  (slide_id, is_patch, row, col)
+# -----------------------------------------------------------------
 
 def parse_filename(filename: str) -> Tuple[str, bool, Optional[int], Optional[int]]:
     """
-    000043_2_2.jpg  →  slide='000043', is_patch=True,  row=2, col=2
-    000043.jpg      →  slide='000043', is_patch=False, row=None, col=None
+    000043_2_2.jpg  ->  slide='000043', is_patch=True,  row=2, col=2
+    000043.jpg      ->  slide='000043', is_patch=False, row=None, col=None
     """
     stem = Path(filename).stem
     m = re.match(r"^(\d+)_(\d+)_(\d+)$", stem)
@@ -55,9 +59,9 @@ def parse_filename(filename: str) -> Tuple[str, bool, Optional[int], Optional[in
     return stem, False, None, None
 
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 #  Build image index
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 
 def build_image_index(
     test_folder: str,
@@ -85,9 +89,6 @@ def build_image_index(
             sid, is_patch, row, col = parse_filename(f)
             prefix = f"{subfolder_tag}_" if subfolder_tag else ""
             iname = f"{prefix}{Path(f).stem}"
-            # Use raw sid (no subfolder prefix) so patches from pos/neg/mixed
-            # subfolders that share the same slide number are grouped together.
-            # e.g. pos/000299_1_4.jpg and mixed/000299_0_1.jpg → slide "000299"
             slide_id = sid
             slides[slide_id].append(iname)
             image_info[iname] = {
@@ -111,9 +112,9 @@ def build_image_index(
     return dict(slides), image_info
 
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 #  Run inference
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 
 @torch.no_grad()
 def run_inference(
@@ -125,10 +126,14 @@ def run_inference(
 ) -> Dict:
     """
     Returns raw_predictions:
-        {image_name: {probs, predicted, conf, conf_tier, prob_G, prob_Gplus}}
+        {image_name: {predicted, conf, conf_tier, prob_G, prob_Gplus, ...}}
+
+    Confidence tiers are binary (two-tier):
+        HIGH  conf >= config.HIGH_CONF_THR
+        LOW   conf <  config.HIGH_CONF_THR
 
     Supports 2-class (G / Gplus) and 3-class (G / Gplus / Mix).
-    INT_TO_LABEL from config maps class index → label string.
+    INT_TO_LABEL from config maps class index -> label string.
     """
     model.eval()
     raw: Dict = {}
@@ -136,7 +141,7 @@ def run_inference(
 
     for i, (iname, info) in enumerate(image_info.items(), 1):
         if i % 50 == 0 or i == total:
-            print(f"  [{i}/{total}] inference…", end="\r")
+            print(f"  [{i}/{total}] inference...", end="\r")
 
         img_bgr = cv2.imread(info["full_path"], cv2.IMREAD_COLOR)
         if img_bgr is None:
@@ -149,19 +154,13 @@ def run_inference(
         logits = model(x)
         probs  = torch.softmax(logits, dim=1)[0].cpu().tolist()
 
-        # Best class
-        best_idx   = int(np.argmax(probs))
-        conf       = float(probs[best_idx])
-        predicted  = config.INT_TO_LABEL.get(best_idx, str(best_idx))
+        best_idx  = int(np.argmax(probs))
+        conf      = float(probs[best_idx])
+        predicted = config.INT_TO_LABEL.get(best_idx, str(best_idx))
 
-        if conf >= config.HIGH_CONF_THR:
-            tier = "HIGH"
-        elif conf >= config.MEDIUM_CONF_THR:
-            tier = "MEDIUM"
-        else:
-            tier = "LOW"
+        # Two-tier confidence: HIGH or LOW 
+        tier = "HIGH" if conf >= config.HIGH_CONF_THR else "LOW"
 
-        # Always expose prob_G and prob_Gplus for PyReason compatibility
         entry = {
             "predicted":  predicted,
             "conf":       conf,
@@ -169,7 +168,6 @@ def run_inference(
             "prob_G":     float(probs[0]) if len(probs) > 0 else 0.0,
             "prob_Gplus": float(probs[1]) if len(probs) > 1 else 0.0,
         }
-        # Also store all class probs for reference
         for idx, p in enumerate(probs):
             label = config.INT_TO_LABEL.get(idx, f"class{idx}")
             entry[f"prob_{label}"] = float(p)
