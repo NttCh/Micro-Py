@@ -4,26 +4,37 @@ src/pyreason_engine.py
 Pure-Python implementation of the PyReason slide+section rules.
 
 Rule naming (canonical):
-  Rule 1a  — Mixed patch in dominant SECTION/WINDOW    -> section/window majority
-  Rule 1b  — minority firm patch in dominant SECTION/WINDOW -> section/window majority
-             (requires dominant_strict — higher evidence bar than Rule 1a)
-  Rule 2   — uncertain/LOW patch + >=N HIGH neighbours agree -> neighbour class
+  Rule 0   — HIGH-conf firm patch → immutable anchor for correction rules.
+             It is not changed by Rule 1/2. However, if it is spatially
+             inconsistent with the slide majority, it may still be included
+             in Rule 3 as a minority-firm cluster candidate.
+  Rule 1a  — Mixed patch in dominant SECTION/WINDOW → section/window majority.
+  Rule 1b  — Minority firm patch in dominant SECTION/WINDOW → section/window majority
+             (requires dominant_strict — higher evidence bar than Rule 1a).
+  Rule 2   — Uncertain/LOW patch + >=N HIGH neighbours agree → neighbour class.
              Fires only when Rule 1a/1b did NOT already correct the patch.
-  Rule 3   — cluster of 3+ adjacent uncertain/minority patches -> flag mixed zone
-  Rule 4   — conf < MEDIUM_CONF_THR or predicted Mixed  -> flag for human review
-             Stacks on top of any Rule 1/2 correction (flag + change are independent).
+  Rule 3   — Cluster of 3+ adjacent uncertainty/minority patches → flag as
+             spatially coherent disagreement/uncertainty zone.
+             Candidates include:
+               (a) Mixed/deferred predictions
+               (b) LOW-confidence predictions
+               (c) firm minority predictions of any confidence tier, including HIGH
+             Rule 3 does not change the predicted class.
+  Rule 4   — Isolated LOW-conf or Mixed patch with no prior Rule 1/2 correction
+             and no Rule 3 cluster flag → flag for human review.
+
+Priority chain (strictly enforced; no stacking):
+  Rule 1/2 correction  >  Rule 3 cluster flag  >  Rule 4 isolated flag
+
+No tier assignment is performed in this file. The engine only returns:
+  final_predicted, rule_applied, changed, needs_review, correction_confidence.
 
 Context mode (config.SECTION_MODE):
   "quadrant"  (default) — slide split into N_SECTIONS fixed quadrants (2×2 or 3×3).
-              Each patch's context = every other patch in the same quadrant.
-  "window"    — each patch's context = patches in a sliding W_ROWS × W_COLS window
-              centred on that patch. No hard region boundaries.
+  "window"    — per-patch sliding W_ROWS × W_COLS window.
 
 Rule execution order per patch:
-  Rule 0 (anchor guard) → Rule 1a/1b → Rule 2 → Rule 3 → Rule 4
-
-Anchor guard (applied before all rules):
-  Rule 0: conf >= ANCHOR_CONF_THR (= HIGH_CONF_THR) and not Mixed → immutable, skip all rules.
+  Rule 0 correction guard → Rule 1a/1b → Rule 2 → Rule 3 → Rule 4
 """
 
 from __future__ import annotations
@@ -32,9 +43,6 @@ from typing import Dict, List, Set, Tuple
 
 import config
 
-# With a 2-class CNN (G / Gplus only), the model never predicts "Mixed".
-# UNCERTAIN_CLASSES is kept for backward compat with 3-class checkpoints
-# and for Rule 2/3/4 which treat Mixed as uncertain.
 UNCERTAIN_CLASSES = {"Mixed", "Mix", "mix", "mixed"}
 
 
@@ -89,13 +97,13 @@ def _find_clusters(patches: List[str], neighbors: Dict[str, List[str]],
 
 
 # ─────────────────────────────────────────────────────────────────
-#  Slide vote  (used only for diagnostics + Rule 3 reference)
+#  Slide vote  (diagnostics + Rule 3 reference)
 # ─────────────────────────────────────────────────────────────────
 
 def compute_slide_vote(slides: Dict, raw: Dict) -> Dict:
     """
     Per-slide majority vote. Mixed patches abstain.
-    Result is used for:
+    Result used for:
       - diagnostics / logging
       - Rule 3 cluster detection (reference majority for minority labelling)
     NOT used to correct individual patch predictions.
@@ -137,11 +145,9 @@ def compute_slide_vote(slides: Dict, raw: Dict) -> Dict:
         )
     return vote
 
+
 # ─────────────────────────────────────────────────────────────────
 #  Context vote helpers
-#  Two modes controlled by config.SECTION_MODE:
-#    "quadrant" → fixed N_SECTIONS quadrants per slide
-#    "window"   → sliding W_ROWS × W_COLS window per patch
 # ─────────────────────────────────────────────────────────────────
 
 def _make_section_vote_entry(preds: List[Dict],
@@ -191,26 +197,14 @@ def _make_section_vote_entry(preds: List[Dict],
 def compute_section_vote(slides: Dict, raw: Dict, image_info: Dict) -> Dict:
     """
     QUADRANT MODE — divide each slide into N_SECTIONS quadrants (default 4 = 2×2).
-
     Each section is voted independently. Stamps image_info[patch]["section_id"].
 
     Returns:
         {slide_id: {section_id: {majority, ratio, n_firm, mixed_fraction,
                                   dominant, dominant_strict}}}
-
-    Section layout for N_SECTIONS=4 (sq=2):
-        | 0 | 1 |
-        | 2 | 3 |
-    Split point determined by the span of actual patch coordinates in that slide.
-
-    Why sections over whole-slide vote:
-      - Whole-slide vote is diluted when a slide has distinct spatial regions.
-      - Neighbourhoods of 2-4 patches fire too easily on sparse grids.
-      - A quadrant (typically 3-12 patches) gives a reliable local majority
-        that aligns with the spatial biology without being too narrow.
     """
     n_sections     = getattr(config, "N_SECTIONS", 4)
-    sq             = max(1, int(n_sections ** 0.5))   # 4→2, 9→3
+    sq             = max(1, int(n_sections ** 0.5))
     MIN_PATCHES    = getattr(config, "SECTION_MIN_PATCHES", 2)
     SECTION_RATIO  = getattr(config, "SECTION_MAJORITY_RATIO_THR",
                              config.MAJORITY_RATIO_THR)
@@ -268,19 +262,6 @@ def compute_window_vote(slides: Dict, raw: Dict, image_info: Dict) -> Dict:
     Returns:
         {patch_name: {majority, ratio, n_firm, mixed_fraction,
                        dominant, dominant_strict}}
-
-    Advantages over fixed quadrants:
-      - No hard boundary artefact: two adjacent patches always share most of their
-        context, so the vote changes smoothly across the slide.
-      - Patches near region boundaries get context that reflects their immediate
-        neighbourhood rather than an arbitrary quadrant assignment.
-
-    Window dimensions from config (defaults to 4 rows × 3 cols = 12-patch window):
-        WINDOW_ROWS = getattr(config, "WINDOW_ROWS", 4)
-        WINDOW_COLS = getattr(config, "WINDOW_COLS", 3)
-
-    For boundary patches (edge/corner of slide), the window simply clips to
-    available patches — no padding or mirror fill.
     """
     W_ROWS = getattr(config, "WINDOW_ROWS", 4)
     W_COLS = getattr(config, "WINDOW_COLS", 3)
@@ -295,28 +276,25 @@ def compute_window_vote(slides: Dict, raw: Dict, image_info: Dict) -> Dict:
     RATIO_MINOR       = getattr(config, "SECTION_MINORITY_RATIO_THR",
                                 min(config.MAJORITY_RATIO_THR + 0.15, 0.90))
 
-    # Build grid lookup: (slide_id, row, col) -> patch_name
     grid: Dict[Tuple, str] = {}
     for n, info in image_info.items():
         if info.get("row") is not None and info.get("col") is not None:
             grid[(info["slide_id"], info["row"], info["col"])] = n
 
-    hr = W_ROWS // 2   # half-extent rows  (e.g. 4→2)
-    hc = W_COLS // 2   # half-extent cols  (e.g. 3→1)
+    hr = W_ROWS // 2
+    hc = W_COLS // 2
 
     win_votes: Dict[str, Dict] = {}
 
     for n, info in image_info.items():
         r, c, sid = info.get("row"), info.get("col"), info.get("slide_id")
         if r is None or c is None or sid is None:
-            # Non-grid patch: no context available
             win_votes[n] = dict(
                 majority="TIE", ratio=0.0, n_firm=0, mixed_fraction=0.0,
                 dominant=False, dominant_strict=False,
             )
             continue
 
-        # Collect all patches in the W_ROWS × W_COLS window
         window_names = [
             grid[(sid, r + dr, c + dc)]
             for dr in range(-hr, W_ROWS - hr)
@@ -346,18 +324,23 @@ def run_pyreason(
     Apply all rules and return a corrections dict:
         {image_name: {"rule": str, "new_class": str|None, "needs_review": bool}}
 
-    new_class=None  → flag only (review flag set, prediction unchanged).
-    new_class=str   → prediction changed; needs_review may also be True (Rule 4 stack).
+    Rule priority chain (strictly enforced — no stacking):
+        Rule 1/2 correction  >  Rule 3 cluster flag  >  Rule 4 isolated flag
 
-    Rule execution order per patch:
-        Rule 0 (anchor guard)
-        Rule 1a (Mixed in dominant context)    → correct to context majority
-        Rule 1b (minority firm in dominant context, strict bar) → flip to context majority
-        — if Rule 1a or 1b fired, patch is already in corrections dict;
-          Rule 2 skips it via `if n in corrections: continue`
-        Rule 2  (uncertain/LOW + HIGH neighbour agreement) → correct to agreed class
-        Rule 3  (cluster flag)         → needs_review only
-        Rule 4  (low-conf / Mixed flag) → needs_review only, stacks on any prior rule
+    Rule 3 cluster candidates:
+        (a) Mixed/deferred predictions
+        (b) LOW-confidence predictions
+        (c) firm minority predictions of any confidence tier, including HIGH
+
+    Rule 0 is a correction guard only. HIGH-confidence firm patches are not
+    changed by Rule 1/2, but HIGH-confidence firm minority patches can still be
+    flagged by Rule 3 if they belong to a spatial cluster.
+
+    Rule 4 fires ONLY when no prior rule entry exists for the patch.
+    ANY prior rule (correction OR cluster flag) suppresses Rule 4 entirely.
+
+    No tier assignment is performed here; downstream evaluation code may map
+    rule_applied/changed/needs_review to tiers if needed.
 
     Context mode (config.SECTION_MODE):
         "quadrant" (default) — fixed N_SECTIONS quadrant per slide
@@ -372,14 +355,13 @@ def run_pyreason(
 
     if section_mode == "window":
         win_vote  = compute_window_vote(slides, raw, image_info)
-        # Stamp a dummy section_id so downstream code stays consistent
         for n, info in image_info.items():
             info.setdefault("section_id", 0)
         print(f"  [Context] Window mode  ({getattr(config, 'WINDOW_ROWS', 4)}"
               f"×{getattr(config, 'WINDOW_COLS', 3)} patches per patch)")
     else:
         sec_vote  = compute_section_vote(slides, raw, image_info)
-        win_vote  = None   # not used in quadrant mode
+        win_vote  = None
         print(f"  [Context] Quadrant mode  (N_SECTIONS={getattr(config, 'N_SECTIONS', 4)})")
 
     # Mark non-grid slides
@@ -409,41 +391,30 @@ def run_pyreason(
     print(f"  [Rules] Mixed patches: {n_mixed}   Minority firm: {n_min}")
 
     # ── Counters ─────────────────────────────────────────────────
-    r1a_count = {"G": 0, "Gplus": 0}   # Rule 1a: Mixed → context majority
-    r1b_count = {"G": 0, "Gplus": 0}   # Rule 1b: minority firm → context majority
+    r1a_count = {"G": 0, "Gplus": 0}
+    r1b_count = {"G": 0, "Gplus": 0}
     r2_count  = {"G": 0, "Gplus": 0}
     r3_count  = 0
-    r4_count  = 0
+    r4_count = 0   # flag-only: isolated LOW/Mixed not corrected or cluster-flagged
 
     anchor_conf = getattr(config, "ANCHOR_CONF_THR", config.HIGH_CONF_THR)
 
     # ── Helper: look up context vote for a patch ──────────────────
     def _ctx_vote(n: str) -> Dict:
-        """Return the context-vote dict for patch n (window or quadrant mode)."""
         if section_mode == "window":
             return win_vote.get(n, {})
-        # quadrant mode
         sid    = image_info.get(n, {}).get("slide_id")
         sec_id = image_info.get(n, {}).get("section_id", -1)
         if sid is None or sec_id == -1:
             return {}
         return sec_vote.get(sid, {}).get(sec_id, {})
 
-    # ── Rule 1a / Rule 1b  ────────────────────────────────────────
+    # ── Rule 1a / Rule 1b ─────────────────────────────────────────
     #
-    # Rule 1a — Mixed patch in a dominant context window/quadrant
-    #   → resolve to context majority  (needs dominant, looser bar)
+    # Rule 1a — Mixed patch in a dominant context → resolve to context majority
+    # Rule 1b — minority firm patch in dominant context (strict bar) → flip
     #
-    # Rule 1b — minority firm patch in a dominant context window/quadrant
-    #   → flip to context majority     (needs dominant_strict, stricter bar)
-    #
-    # Guard applied BEFORE checking context:
-    #   Rule 0: conf >= anchor_conf and not Mixed → immutable, skip ALL rules.
-    #
-    # If Rule 1a or 1b fires, the patch is added to corrections; Rule 2
-    # will skip it via `if n in corrections: continue`.
-    # If neither fires (section not dominant, patch is majority class, etc.),
-    # the patch falls through to Rule 2 naturally.
+    # Rule 0 guard: conf >= anchor_conf AND firm → immutable, skip ALL rules.
 
     for n, pred in raw.items():
         # Rule 0: fully immutable anchor
@@ -454,10 +425,9 @@ def run_pyreason(
         ctx = _ctx_vote(n)
 
         if not ctx:
-            continue   # no grid position or context unavailable
-
+            continue
         if not ctx.get("dominant", False):
-            continue   # context not reliable enough for Rule 1a/1b
+            continue
 
         ctx_maj = ctx["majority"]
         if ctx_maj == "TIE":
@@ -475,15 +445,13 @@ def run_pyreason(
         # ── Rule 1b: minority firm patch → flip ──────────────────
         elif cls != ctx_maj:
             if not ctx.get("dominant_strict", False):
-                continue   # context evidence not strong enough to flip a firm pred
+                continue
             corrections[n] = {
                 "rule": "rule1b",
                 "new_class": ctx_maj,
                 "needs_review": False,
             }
             r1b_count["G" if ctx_maj == "G" else "Gplus"] += 1
-
-        # cls == ctx_maj: patch already agrees with context → no action
 
     print(f"  [Rule 1a] Mixed  resolved : {r1a_count['G']} -> G, "
           f"{r1a_count['Gplus']} -> Gplus")
@@ -492,29 +460,21 @@ def run_pyreason(
 
     # ── Rule 2: neighbour agreement ───────────────────────────────
     #
-    # Eligible patches: predicted Mixed OR conf_tier == LOW,
-    #                   AND not already corrected by Rule 1a/1b.
-    #
-    # Condition: >= NEIGHBOR_AGREE_MIN immediate 4-neighbours are all
-    #            HIGH-confidence and all agree on the same class.
-    # Action: correct patch to that agreed class.
-    #
-    # Rule 2 fires on patches that Rule 1 could not help:
-    #   - patch in a non-dominant section/window (section too sparse)
-    #   - patch is the only patch in a slide (standalone)
-    # In all these cases, if strong local neighbour consensus exists,
-    # Rule 2 can still resolve the patch.
+    # Eligible: predicted Mixed OR conf_tier == LOW, AND not corrected by Rule 1.
+    # Condition: >= NEIGHBOR_AGREE_MIN immediate 4-neighbours are all HIGH-confidence
+    #            and all agree on the same class.
+    # Action: correct to that agreed class (Tier 2).
 
     min_nb = config.NEIGHBOR_AGREE_MIN
 
     for n, pred in raw.items():
         if n in corrections:
-            continue   # Rule 1a or 1b already handled this patch
+            continue
 
         cls    = pred["predicted"]
         is_unc = cls in UNCERTAIN_CLASSES or pred["conf_tier"] == "LOW"
         if not is_unc:
-            continue   # only uncertain/LOW patches are eligible for Rule 2
+            continue
 
         nbs = nb_index.get(n, [])
         if not nbs:
@@ -539,69 +499,96 @@ def run_pyreason(
     print(f"  [Rule 2] neighbour : {r2_count['G']} -> G, "
           f"{r2_count['Gplus']} -> Gplus")
 
-    # ── Rule 3: cluster flag ──────────────────────────────────────
+    # ── Rule 3: spatial cluster flag ─────────────────────────────
     #
-    # For each slide, find patches that are either:
-    #   - predicted Mixed, or
-    #   - firm but predicting the minority class (slide majority used as reference)
-    # If 3+ such patches form a connected component → flag all of them for review.
-    # No prediction change; needs_review is set to True.
-    # Rule 3 adds to corrections but does not overwrite a Rule 1/2 new_class.
+    # Cluster candidates:
+    #   (a) predicted Mixed / deferred       — uncertain class
+    #   (b) firm minority of ANY confidence  — spatial disagreement
+    #
+    # Rule 3 is a flagging rule, not a correction rule.
+    # Rule 0 only protects patches from correction by Rule 1/2.
+    # Rule 3 can still flag a high-confidence firm minority patch if it is part
+    # of a qualifying spatial disagreement cluster.
+    #
+    # Invariants:
+    #   - Patches already handled by Rule 1/2 are excluded.
+    #   - No prediction change.
+    #   - Rule 3 does NOT overwrite a Rule 1/2 suggested label.
+    #
+    # Isolated LOW/Mixed patches not handled by Rule 1/2 or Rule 3 → Rule 4.
 
     for sid in slides:
         names = [n for n in slides[sid] if n in raw]
-        maj   = slide_vote.get(sid, {}).get("majority", "TIE")
-        targets = [
-            n for n in names
-            if raw[n]["predicted"] in UNCERTAIN_CLASSES
-            or (maj != "TIE" and raw[n]["predicted"] != maj)
-        ]
+        maj = slide_vote.get(sid, {}).get("majority", "TIE")
+
+        targets = []
+        for n in names:
+            pred_n = raw[n]
+
+            # Rule 1/2 output takes precedence — do not reassign to Rule 3.
+            if n in corrections and corrections[n]["new_class"] is not None:
+                continue
+
+            is_mixed = pred_n["predicted"] in UNCERTAIN_CLASSES
+            is_minority = (
+                not is_mixed
+                and maj != "TIE"
+                and pred_n["predicted"] != maj
+            )
+
+            if is_mixed or is_minority:
+                targets.append(n)
+
         for cluster in _find_clusters(targets, nb_index, config.CLUSTER_MIN):
             for p in cluster:
-                if p not in corrections:
-                    corrections[p] = {
-                        "rule": "rule3_cluster_flag",
-                        "new_class": None,
-                        "needs_review": True,
-                    }
-                else:
-                    corrections[p]["needs_review"] = True
-                r3_count += 1
+                if p in corrections and corrections[p]["new_class"] is not None:
+                    continue
 
-    print(f"  [Rule 3] clusters  : {r3_count}")
-
-    # ── Rule 4: low-confidence / Mixed flag ───────────────────────
-    #
-    # Every patch with conf < MEDIUM_CONF_THR (= REVIEW_CONF_THR) OR
-    # predicted Mixed gets flagged for human review.
-    # This is purely additive:
-    #   - If the patch already has a Rule 1/2 correction → flag stacks on top
-    #     (changed=True AND needs_review=True in apply_corrections output).
-    #   - If the patch has no prior correction → entry is created with
-    #     new_class=None (flag only, no prediction change).
-
-    review_thr = config.MEDIUM_CONF_THR
-
-    for n, pred in raw.items():
-        is_low_conf = pred["conf"] < review_thr
-        is_mixed    = pred["predicted"] in UNCERTAIN_CLASSES
-        if is_low_conf or is_mixed:
-            r4_count += 1
-            if n in corrections:
-                corrections[n]["needs_review"] = True
-            else:
-                corrections[n] = {
-                    "rule": "rule4_review",
+                corrections[p] = {
+                    "rule": "rule3_cluster_flag",
                     "new_class": None,
                     "needs_review": True,
                 }
+                r3_count += 1
 
-    print(f"  [Rule 4] flagged   : {r4_count}")
+    print(
+        f"  [Rule 3] clusters  : {r3_count} "
+        f"(Mixed + firm minority of any confidence)"
+    )
+
+    # ── Rule 4: isolated uncertain patch ─────────────────────────
+    #
+    # Fires ONLY on LOW-conf or Mixed patches that have NO prior rule entry.
+    # Priority chain: Rule 1/2 correction > Rule 3 cluster flag > Rule 4.
+    #
+    # If any prior rule has already acted on a patch (changed it OR flagged it),
+    # Rule 4 is suppressed entirely.
+
+    for n, pred in raw.items():
+        is_low_conf = pred["conf_tier"] == "LOW"
+        is_mixed = pred["predicted"] in UNCERTAIN_CLASSES
+
+        if not (is_low_conf or is_mixed):
+            continue  # not uncertain — Rule 4 does not apply
+
+        # ANY prior rule entry takes precedence — correction OR cluster flag.
+        if n in corrections:
+            continue
+
+        # Isolated uncertain patch — no spatial rule acted on it.
+        r4_count += 1
+        corrections[n] = {
+            "rule": "rule4_refer",
+            "new_class": None,
+            "needs_review": True,
+        }
+
+    print(f"  [Rule 4] refer     : {r4_count} (isolated LOW/Mixed, no cluster)")
     print(
         f"  [Rules] Changed: "
         f"{sum(1 for c in corrections.values() if c['new_class'] is not None)}  "
-        f"Flagged: "
-        f"{sum(1 for c in corrections.values() if c['new_class'] is None and c.get('needs_review'))}"
+        f"Cluster flagged: {r3_count}  "
+        f"Isolated refer: {r4_count}"
     )
 
     return corrections
@@ -616,10 +603,14 @@ def apply_corrections(raw: Dict, corrections: Dict) -> Dict:
     Merge raw CNN predictions with corrections to produce final predictions.
 
     Output per patch:
-        final_predicted : str   — corrected class (or original if no change)
-        rule_applied    : str|None — which rule fired last for prediction change
-        changed         : bool  — True if final_predicted != original predicted
-        needs_review    : bool  — True if any rule flagged this patch for review
+        final_predicted      : str   — corrected class (or original if no change)
+        rule_applied         : str|None — which rule fired
+        changed              : bool  — True if final_predicted != original predicted
+        needs_review         : bool  — True if Rule 3 or Rule 4 flagged for review
+        correction_confidence: str|None — "strong"/"moderate"/None
+                               Set when Rule 1/2 corrected a patch that was LOW/Mixed.
+                               Indicates the spatial rule had enough evidence to handle
+                               what would otherwise have been an unresolved uncertain patch.
     """
     final: Dict = {}
     for iname, pred in raw.items():
@@ -635,10 +626,30 @@ def apply_corrections(raw: Dict, corrections: Dict) -> Dict:
             fp["rule_applied"]    = corr["rule"] if corr else None
             fp["changed"]         = False
 
-        fp["needs_review"] = (
-            corr is not None
-            and (corr["new_class"] is None or corr.get("needs_review", False))
+        fp["needs_review"] = bool(
+            corr is not None and corr.get("needs_review", False)
         )
+
+        # ── Correction confidence tag ─────────────────────────────
+        # If a spatial rule (1a/1b/2) corrected a patch that was LOW or Mixed,
+        # tag the correction so eval can separately assess "how often does the
+        # spatial rule save a would-be Tier 3 patch and get it right?"
+        was_uncertain = (
+            pred["predicted"] in UNCERTAIN_CLASSES or
+            pred["conf_tier"] == "LOW"
+        )
+        was_corrected = fp["changed"]
+        if was_corrected and was_uncertain:
+            rule = corr["rule"] if corr else ""
+            if rule in ("rule1a", "rule1b"):
+                fp["correction_confidence"] = "strong"   # dominant context (high bar)
+            elif rule == "rule2_neighbor":
+                fp["correction_confidence"] = "moderate"  # neighbour agreement
+            else:
+                fp["correction_confidence"] = None
+        else:
+            fp["correction_confidence"] = None
+
         final[iname] = fp
 
     return final
