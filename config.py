@@ -183,7 +183,6 @@ CLASS_WEIGHT_POWER = 0.75
 # ─────────────────────────────────────────────────────────────────
 
 HIGH_CONF_THR        = 0.85   # >= this → HIGH confidence (firm patch for vote)
-MEDIUM_CONF_THR      = 0.75   # >= this → MEDIUM
 
 MAJORITY_RATIO_THR   = 0.70   # slide needs >= this fraction to be "dominant"
 MIN_PATCHES_FOR_VOTE = 3      # slide needs >= this many firm patches for Rule 1
