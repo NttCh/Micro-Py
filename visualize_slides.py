@@ -21,7 +21,7 @@ Output folder structure
       rule1/      slides changed by rule1a or rule1b — THREE panels saved separately:
                     <sid>_1_ml_only.png        before (no window overlay)
                     <sid>_2_ml_window.png      before + window border on changed patch
-                    <sid>_3_after.png          after PyReason
+                    <sid>_3_after.png          after rule-based
       rule2/      slides changed by rule2 only — two panels (ML | After)
       rule3/      slides with cluster flags    — two panels
       rule4/      slides with low-conf flags   — two panels
@@ -68,13 +68,15 @@ RULE_COLOR = {
     "rule1b":              "#B03030",
     "rule2_neighbor":      "#1A7A8A",
     "rule3_cluster_flag":  "#666666",
-    "rule4_review":        "#444444",
+    "rule4_refer":         "#444444",   # canonical name from engine v2
     "rule1f_mixed":        "#C48A00",
     "rule1a_mixed":        "#C48A00",
     "rule1f_minority":     "#B03030",
     "rule1b_minority":     "#B03030",
     "rule2_cluster_flag":  "#666666",
-    "rule3_review":        "#444444",
+    # legacy aliases kept so old CSVs still render
+    "rule3_review":        "#666666",
+    "rule4_review":        "#444444",
 }
 
 SECTION_PALETTE  = ["#F4A0A0", "#70C8C0", "#70AED4", "#A0CEB0"]
@@ -91,6 +93,9 @@ _RULE_ALIAS = {
     "rule1a_mixed":    "rule1a",
     "rule1f_minority": "rule1b",
     "rule1b_minority": "rule1b",
+    # legacy engine names → canonical
+    "rule3_review":    "rule3_cluster_flag",
+    "rule4_review":    "rule4_refer",
 }
 
 def _norm_rule(rule: str) -> str:
@@ -100,10 +105,9 @@ RULE1_NAMES = {"rule1a", "rule1b",
                "rule1f_mixed", "rule1a_mixed",
                "rule1f_minority", "rule1b_minority"}
 
-def _conf_tier_label(conf: float, high_thr: float, low_thr: float) -> str:
-    if conf >= high_thr: return "H"
-    elif conf < low_thr: return "L"
-    return "M"
+def _conf_tier_label(conf: float, high_thr: float, low_thr: float = 0.0) -> str:
+    """Two-tier: HIGH (H) or LOW (L). low_thr kept as unused arg for call-site compat."""
+    return "H" if conf >= high_thr else "L"
 
 TITLE_FONT  = {"fontfamily": "Times New Roman", "fontweight": "normal"}
 DETAIL_FONT = {"fontfamily": "Arial",           "fontweight": "normal"}
@@ -130,7 +134,6 @@ class DrawConfig:
         window_rows:     int   = 4,
         window_cols:     int   = 3,
         high_conf_thr:   float = 0.85,
-        medium_conf_thr: float = 0.75,
         anchor_conf_thr: float = 0.85,
         section_min_patches:         int   = 2,
         section_majority_ratio_thr:  float = 0.70,
@@ -143,7 +146,6 @@ class DrawConfig:
         self.window_rows    = window_rows
         self.window_cols    = window_cols
         self.high_conf_thr  = high_conf_thr
-        self.medium_conf_thr = medium_conf_thr
         self.anchor_conf_thr = anchor_conf_thr
         self.section_min_patches        = section_min_patches
         self.section_majority_ratio_thr = section_majority_ratio_thr
@@ -223,7 +225,6 @@ def load_draw_config(csv_path: str) -> DrawConfig:
             window_rows     = int(getattr(config, "WINDOW_ROWS",    4)),
             window_cols     = int(getattr(config, "WINDOW_COLS",    3)),
             high_conf_thr   = float(getattr(config, "HIGH_CONF_THR",   0.85)),
-            medium_conf_thr = float(getattr(config, "MEDIUM_CONF_THR", 0.75)),
             anchor_conf_thr = float(getattr(config, "ANCHOR_CONF_THR", 0.85)),
             section_min_patches        = int(getattr(config, "SECTION_MIN_PATCHES", 2)),
             section_majority_ratio_thr = float(getattr(config, "SECTION_MAJORITY_RATIO_THR",
@@ -257,11 +258,12 @@ def load_draw_config(csv_path: str) -> DrawConfig:
             window_rows     = _get("WINDOW_ROWS x WINDOW_COLS", None, str),  # handled below
             window_cols     = 3,   # placeholder
             high_conf_thr   = _get("HIGH_CONF_THR",   0.85,  float),
-            medium_conf_thr = float(getattr(config, "MEDIUM_CONF_THR", 0.75)),
             anchor_conf_thr = _get("ANCHOR_CONF_THR", 0.85,  float),
             section_min_patches        = _get("SECTION_MIN_PATCHES",        2,    int),
             section_majority_ratio_thr = _get("SECTION_MAJORITY_RATIO_THR", 0.70, float),
-            section_max_mixed_fraction = float(getattr(config, "SECTION_MAX_MIXED_FRACTION", 0.30)),
+            section_max_mixed_fraction = _get("SECTION_MAX_MIXED_FRACTION",
+                                              float(getattr(config, "SECTION_MAX_MIXED_FRACTION", 0.30)),
+                                              float),
             stronghold_min  = _get("STRONGHOLD_MIN",  2, int),
             source          = os.path.relpath(txt_path),
         )
@@ -571,7 +573,7 @@ def _draw_panel(ax, df_slide, title: str, dc: DrawConfig, mode: str = "after"):
             if pred in UNCERTAIN: return "Mx"
             return pred
 
-        tier = _conf_tier_label(ml_conf, dc.high_conf_thr, dc.medium_conf_thr)
+        tier = _conf_tier_label(ml_conf, dc.high_conf_thr)
 
         if mode == "after" and changed:
             ax.text(c, r - 0.18, f"{_short(ml_pred)}→{_short(final_pred)}",
@@ -593,14 +595,18 @@ def _draw_panel(ax, df_slide, title: str, dc: DrawConfig, mode: str = "after"):
                     ha="center", va="center", fontsize=9,
                     color=WRONG_MARK_COLOR, **DETAIL_FONT, zorder=8)
 
-    # ── Axes ─────────────────────────────────────────────────────
-    ax.set_xlim(-0.5, GRID_COLS - 0.5)
-    ax.set_ylim(GRID_ROWS - 0.5, -0.5)
+    # ── Axes — sized to actual data extent ───────────────────────
+    all_gcols = df_slide["gcol"].dropna()
+    all_grows = df_slide["grow"].dropna()
+    col_max = int(all_gcols.max()) if len(all_gcols) else GRID_COLS - 1
+    row_max = int(all_grows.max()) if len(all_grows) else GRID_ROWS - 1
+    ax.set_xlim(-0.5, max(col_max, GRID_COLS - 1) + 0.5)
+    ax.set_ylim(max(row_max, GRID_ROWS - 1) + 0.5, -0.5)
     ax.set_xticks([]); ax.set_yticks([])
 
-    for x in np.arange(-0.5, GRID_COLS, 1.0):
+    for x in np.arange(-0.5, max(col_max, GRID_COLS - 1) + 1, 1.0):
         ax.axvline(x, color="#555555", linewidth=0.6, alpha=0.20, zorder=0)
-    for y in np.arange(-0.5, GRID_ROWS, 1.0):
+    for y in np.arange(-0.5, max(row_max, GRID_ROWS - 1) + 1, 1.0):
         ax.axhline(y, color="#555555", linewidth=0.6, alpha=0.20, zorder=0)
 
     # Bold section boundary lines (quadrant mode only)
@@ -632,7 +638,7 @@ def draw_slide_dual(ax_before, ax_after, df_slide, slide_id, stats: dict, dc: Dr
     n_p   = stats.get("n_patches",  len(df_slide))
 
     title_before = f"Slide {slide_id}  [{n_p} patches]  —  ML only"
-    title_after  = (f"After PyReason  |  R1a={n_r1a}  R1b={n_r1b}  "
+    title_after  = (f"After rule-based  |  R1a={n_r1a}  R1b={n_r1b}  "
                     f"R2={n_r2}  chg={n_ch}  wors={n_wor}")
 
     _draw_panel(ax_before, df_slide, title=title_before, dc=dc, mode="before")
@@ -669,7 +675,7 @@ def _build_legend_handles(dc: DrawConfig):
         "•  review flag (no pred change)",
         "////  anchor (HIGH conf)",
         ctx_label,
-        "top = pred  |  bottom = tier + conf  (H/M/L)",
+        "top = pred  |  bottom = tier + conf  (H/L)",
         "bright section bg = contains changed patch",
     ]
     elems = []
@@ -730,6 +736,167 @@ def save_legend_standalone(out_dir: str, dc: DrawConfig):
 
 
 # ─────────────────────────────────────────────────────────────────
+#  Triage panel  (tier-coloured view)
+#
+#  Same grid geometry as _draw_panel.
+#  Cell fill = triage tier colour.  X on wrong final predictions.
+#  Mixed GT patches without row/col land in an overflow row
+#  (placed by _to_grid) so they are always visible.
+# ─────────────────────────────────────────────────────────────────
+
+TIER_COLOR = {
+    1: "#8bb174",   # green   — Confirmed
+    2: "#ffc971",   # yellow  — Suggested
+    3: "#ea8c55",   # orange  — Attention
+    4: "#a51c30",   # red     — Refer
+}
+TIER_TEXT_COLOR = {
+    1: "#1A1A1A",
+    2: "#1A1A1A",
+    3: "#1A1A1A",
+    4: "#1A1A1A",
+}
+TIER_LABEL_SHORT = {1: "T1 Confirmed", 2: "T2 Suggested",
+                    3: "T3 Attention", 4: "T4 Refer"}
+
+
+def _draw_triage_panel(ax, df_slide, title: str, dc: DrawConfig):
+    import matplotlib.patches as mpatches
+
+    ax.set_facecolor(AX_COLOR)
+
+    df_slide, bounds = assign_sections(df_slide, dc)
+    if bounds is None:
+        ax.text(0.5, 0.5, "No grid patches", ha="center", va="center",
+                color=CELL_TEXT_COLOR, transform=ax.transAxes, fontsize=11,
+                **DETAIL_FONT)
+        ax.set_title(title.upper(), fontsize=16, color="#1A1A2E", pad=5, **TITLE_FONT)
+        return
+
+    df_slide, rows_sorted, cols_sorted = _to_grid(df_slide)
+
+    sq         = dc.sq
+    n_sections = dc.n_sections
+
+    if dc.section_mode != "window":
+        for sec_id in range(n_sections):
+            rb, cb = sec_id // sq, sec_id % sq
+            c0_d = cb * GRID_COLS / sq;  c1_d = (cb + 1) * GRID_COLS / sq
+            r0_d = rb * GRID_ROWS / sq;  r1_d = (rb + 1) * GRID_ROWS / sq
+            color = SECTION_PALETTE[sec_id % len(SECTION_PALETTE)]
+            ax.add_patch(mpatches.FancyBboxPatch(
+                (c0_d - 0.5, r0_d - 0.5), c1_d - c0_d, r1_d - r0_d,
+                linewidth=0.4, edgecolor=color, facecolor=color,
+                alpha=0.07, boxstyle="round,pad=0", zorder=1))
+
+    _bold_font   = {"fontfamily": DETAIL_FONT["fontfamily"], "fontweight": "bold"}
+    _normal_font = {"fontfamily": DETAIL_FONT["fontfamily"], "fontweight": "normal"}
+
+    for _, row in df_slide.iterrows():
+        r, c = row.get("grow"), row.get("gcol")
+        if pd.isna(r) or pd.isna(c):
+            continue
+        r, c = int(r), int(c)
+
+        tier_raw   = row.get("triage_tier")
+        tier       = int(tier_raw) if pd.notna(tier_raw) else 0
+        pr_correct = row.get("pr_correct")
+        is_wrong   = (pr_correct is False) or (pr_correct == False)
+
+        fc = TIER_COLOR.get(tier, "#AAAAAA")
+        tc = TIER_TEXT_COLOR.get(tier, "#1A1A1A")
+
+        ax.add_patch(mpatches.FancyBboxPatch(
+            (c - 0.45, r - 0.45), 0.90, 0.90,
+            linewidth=0.7, edgecolor="#BBBBBB", facecolor=fc,
+            alpha=0.90, boxstyle="round,pad=0.03", zorder=3))
+
+        label_short = TIER_LABEL_SHORT.get(tier, f"T{tier}")
+        t_num, _, t_name = label_short.partition(" ")
+        ax.text(c, r - 0.15, t_num, ha="center", va="center", fontsize=11,
+                color=tc, zorder=7, **_bold_font)
+        ax.text(c, r + 0.22, t_name, ha="center", va="center", fontsize=8,
+                color=tc, alpha=0.90, zorder=7, **_normal_font)
+
+        if is_wrong:
+            ax.text(c - 0.33, r - 0.33, "X", ha="center", va="center",
+                    fontsize=11, color="#7B0000", zorder=8, **_bold_font)
+
+    all_gcols = df_slide["gcol"].dropna()
+    all_grows = df_slide["grow"].dropna()
+    col_max = int(all_gcols.max()) if len(all_gcols) else GRID_COLS - 1
+    row_max = int(all_grows.max()) if len(all_grows) else GRID_ROWS - 1
+    ax.set_xlim(-0.5, max(col_max, GRID_COLS - 1) + 0.5)
+    ax.set_ylim(max(row_max, GRID_ROWS - 1) + 0.5, -0.5)
+    ax.set_xticks([]); ax.set_yticks([])
+
+    for x in np.arange(-0.5, max(col_max, GRID_COLS - 1) + 1, 1.0):
+        ax.axvline(x, color="#555555", linewidth=0.6, alpha=0.20, zorder=0)
+    for y in np.arange(-0.5, max(row_max, GRID_ROWS - 1) + 1, 1.0):
+        ax.axhline(y, color="#555555", linewidth=0.6, alpha=0.20, zorder=0)
+
+    if dc.section_mode != "window":
+        for qi in range(1, sq):
+            ax.axvline(qi * GRID_COLS / sq - 0.5,
+                       color="#222222", linewidth=2.2, alpha=0.60, zorder=5)
+        for qi in range(1, sq):
+            ax.axhline(qi * GRID_ROWS / sq - 0.5,
+                       color="#222222", linewidth=2.2, alpha=0.60, zorder=5)
+
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#AAAAAA"); spine.set_linewidth(0.8)
+
+    ax.set_title(title.upper(), fontsize=16, color="#1A1A2E", pad=5, **TITLE_FONT)
+
+
+def _build_triage_legend_handles():
+    import matplotlib.patches as mpatches
+    items = [
+        ("Tier 1  Confirmed  (spot-check)",          TIER_COLOR[1]),
+        ("Tier 2  Suggested  (confirm/override)",     TIER_COLOR[2]),
+        ("Tier 3  Attention  (cluster review)",       TIER_COLOR[3]),
+        ("Tier 4  Refer      (full expert review)",   TIER_COLOR[4]),
+    ]
+    handles = [mpatches.Patch(facecolor=fc, edgecolor="#888", linewidth=0.6, label=lbl)
+               for lbl, fc in items]
+    handles.append(mpatches.Patch(facecolor="none", edgecolor="none", label=" "))
+    handles.append(mpatches.Patch(facecolor="none", edgecolor="none",
+                                  label="X  =  pr_correct == False  (wrong final prediction)"))
+    handles.append(mpatches.Patch(facecolor="none", edgecolor="none",
+                                  label="Mixed GT patches without row/col appear below the grid"))
+    return handles
+
+
+def make_triage_legend(fig):
+    fig.legend(
+        handles=_build_triage_legend_handles(),
+        loc="lower center", ncol=3, framealpha=0.95,
+        bbox_to_anchor=(0.5, 0.0), labelcolor="#1A1A2E",
+        facecolor="#F5F5F5", edgecolor="#BBBBBB",
+        handlelength=1.6, handleheight=1.2,
+        columnspacing=1.5, handletextpad=0.7,
+        prop={"family": "Arial", "size": 10, "weight": "normal"},
+    )
+
+
+def draw_slide_triage(ax_class, ax_tier, df_slide, slide_id,
+                      stats: dict, dc: DrawConfig):
+    """Left: after rule-based class panel. Right: tier-coloured panel."""
+    n_p  = stats.get("n_patches", len(df_slide))
+    n_t1 = int((df_slide["triage_tier"] == 1).sum()) if "triage_tier" in df_slide.columns else 0
+    n_t2 = int((df_slide["triage_tier"] == 2).sum()) if "triage_tier" in df_slide.columns else 0
+    n_t3 = int((df_slide["triage_tier"] == 3).sum()) if "triage_tier" in df_slide.columns else 0
+    n_t4 = int((df_slide["triage_tier"] == 4).sum()) if "triage_tier" in df_slide.columns else 0
+
+    title_class = f"Slide {slide_id}  [{n_p} patches]  —  After rule-based (class)"
+    title_tier  = (f"Triage tiers  |  T1={n_t1}  T2={n_t2}  T3={n_t3}  T4={n_t4}"
+                   f"  (X = wrong final pred)")
+
+    _draw_panel(ax_class, df_slide, title=title_class, dc=dc, mode="after")
+    _draw_triage_panel(ax_tier, df_slide, title=title_tier, dc=dc)
+
+
+# ─────────────────────────────────────────────────────────────────
 #  Helpers
 # ─────────────────────────────────────────────────────────────────
 
@@ -741,7 +908,7 @@ def _slide_stats(df_s: pd.DataFrame) -> dict:
         n_r1a      = int((rule_col == "rule1a").sum()),
         n_r1b      = int((rule_col == "rule1b").sum()),
         n_r2       = int((rule_col == "rule2_neighbor").sum()),
-        n_worsened = int((df_s["outcome"] == "worsened").sum())
+        n_worsened = int((df_s["outcome"] == "error").sum())
                     if "outcome" in df_s.columns else 0,
     )
 
@@ -751,7 +918,7 @@ def pick_interesting_slides(df: pd.DataFrame, n: int = 5) -> list:
         n_patches =("image_name",   "count"),
         n_r1      =("rule_applied",
                     lambda x: x.apply(_norm_rule).isin({"rule1a","rule1b"}).sum()),
-        n_worsened=("outcome",      lambda x: (x == "worsened").sum()),
+        n_worsened=("outcome",      lambda x: (x == "error").sum()),
         n_changed =("changed",      "sum"),
     ).reset_index()
     stats = stats.sort_values(["n_r1","n_worsened","n_changed"], ascending=False)
@@ -848,9 +1015,16 @@ def main():
         "rule2":   os.path.join(base, "by_rule", "rule2"),
         "rule3":   os.path.join(base, "by_rule", "rule3"),
         "rule4":   os.path.join(base, "by_rule", "rule4"),
+        "triage":  os.path.join(base, "triage"),   # tier-coloured dual panels
     }
     for d in dirs.values():
         os.makedirs(d, exist_ok=True)
+
+    # Warn early if triage_tier column is absent (old CSV)
+    has_tier = "triage_tier" in df.columns
+    if not has_tier:
+        print("  [Triage] WARNING: 'triage_tier' column not found — "
+              "triage panels will show grey cells. Re-run evaluate.py to add it.")
 
     print(f"Output root: {base}")
 
@@ -867,7 +1041,8 @@ def main():
         has_rule1   = bool((rule_col.isin({"rule1a","rule1b"})).any())
         has_rule2   = bool((rule_col == "rule2_neighbor").any())
         has_rule3   = bool((rule_col == "rule3_cluster_flag").any())
-        has_rule4   = bool((rule_col == "rule4_review").any())
+        has_rule4   = bool((rule_col == "rule4_refer").any()
+                           or (rule_col == "rule4_review").any())  # legacy alias
         any_changed = bool(df_s["changed"].any())
 
         n_p   = stats["n_patches"]
@@ -904,7 +1079,7 @@ def main():
                           else f"quadrant {dc.sq}×{dc.sq}")
             title_ml   = f"Slide {sid}  [{n_p} patches]  —  ML ONLY"
             title_win  = f"Slide {sid}  —  ML ONLY + CONTEXT ({ctx_str})"
-            title_after= (f"After PyReason  |  R1a={n_r1a}  R1b={n_r1b}  "
+            title_after= (f"After rule-based  |  R1a={n_r1a}  R1b={n_r1b}  "
                           f"chg={n_ch}  wors={n_wor}")
 
             fig1, ax1 = plt.subplots(1, 1, figsize=(9, 6))
@@ -928,7 +1103,7 @@ def main():
         # ── (D) by_rule/rule2/ ───────────────────────────────────
         if has_rule2 and not has_rule1:
             title_ml    = f"Slide {sid}  [{n_p} patches]  —  ML ONLY"
-            title_after = f"After PyReason  |  R2={n_r2}  chg={n_ch}  wors={n_wor}"
+            title_after = f"After rule-based  |  R2={n_r2}  chg={n_ch}  wors={n_wor}"
 
             fig1, ax1 = plt.subplots(1, 1, figsize=(9, 6))
             fig1.patch.set_facecolor(BG_COLOR)
@@ -945,7 +1120,7 @@ def main():
         # ── (E) by_rule/rule3/ ───────────────────────────────────
         if has_rule3 and not has_rule1 and not has_rule2:
             title_ml    = f"Slide {sid}  [{n_p} patches]  —  ML ONLY"
-            title_after = f"After PyReason  |  R3 cluster flagged  chg={n_ch}  wors={n_wor}"
+            title_after = f"After rule-based  |  R3 cluster flagged  chg={n_ch}  wors={n_wor}"
 
             fig1, ax1 = plt.subplots(1, 1, figsize=(9, 6))
             fig1.patch.set_facecolor(BG_COLOR)
@@ -962,7 +1137,7 @@ def main():
         # ── (F) by_rule/rule4/ ───────────────────────────────────
         if has_rule4 and not has_rule1 and not has_rule2 and not has_rule3:
             title_ml    = f"Slide {sid}  [{n_p} patches]  —  ML ONLY"
-            title_after = f"After PyReason  |  R4 low-conf flagged  chg={n_ch}  wors={n_wor}"
+            title_after = f"After rule-based  |  R4 low-conf flagged  chg={n_ch}  wors={n_wor}"
 
             fig1, ax1 = plt.subplots(1, 1, figsize=(9, 6))
             fig1.patch.set_facecolor(BG_COLOR)
@@ -976,11 +1151,23 @@ def main():
             _draw_panel(ax2, df_s, title=title_after, dc=dc, mode="after")
             _save_single(fig2, os.path.join(dirs["rule4"], f"{sid}_2_after.png"))
 
+        # ── (G) triage/ — class panel | tier panel ───────────────
+        # Saved for every slide. Uses full df_s including any Mixed GT
+        # patches placed in the overflow row by _to_grid.
+        fig_t, (ax_cl, ax_ti) = plt.subplots(
+            1, 2, figsize=(18, 6), gridspec_kw={"wspace": 0.08})
+        fig_t.patch.set_facecolor(BG_COLOR)
+        draw_slide_triage(ax_cl, ax_ti, df_s, sid, stats, dc)
+        make_triage_legend(fig_t)
+        plt.subplots_adjust(bottom=0.15, left=0.04, right=0.97)
+        _save_single(fig_t, os.path.join(dirs["triage"], f"slide_{sid}.png"))
+
         if (i + 1) % 10 == 0:
             print(f"  {i+1}/{len(all_slides)} done…")
 
     print(f"\n  Saved {len(all_slides)} slides → {dirs['all']}/")
     print(f"  Saved {n_changed} changed slides → {dirs['changed']}/")
+    print(f"  Saved {len(all_slides)} triage slides → {dirs['triage']}/")
 
     # ── 5-sample summary ─────────────────────────────────────────
     chosen = pick_interesting_slides(df, n=5) or list(df["slide_id"].unique()[:5])
@@ -1002,7 +1189,7 @@ def main():
 
     make_legend(fig, dc, large=False)
     fig.suptitle(
-        "PYREASON — BEFORE / AFTER  (5 MOST-CHANGED SLIDES)",
+        "RULE-BASED — BEFORE / AFTER  (5 MOST-CHANGED SLIDES)",
         fontsize=20, color="#1A1A2E", y=1.003, **TITLE_FONT,
     )
     plt.subplots_adjust(bottom=0.06, left=0.04, right=0.97)
