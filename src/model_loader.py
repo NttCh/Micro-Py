@@ -2,7 +2,6 @@
 src/model_loader.py
 ===================
 Build a bare ResNet classifier and load weights from a Lightning checkpoint.
-No KAN, no attention heads, no training code.
 
 Key fix: Lightning saves weights as "model.fc.weight" / "model.fc.bias".
 We strip the "model." prefix, then replace the fc head AFTER inspecting
@@ -88,8 +87,14 @@ def build_and_load(
         in_features = model.fc.in_features
         model.fc = nn.Linear(in_features, num_classes)
     elif hasattr(model, "classifier"):
-        in_features = model.classifier[-1].in_features
-        model.classifier[-1] = nn.Linear(in_features, num_classes)
+        if isinstance(model.classifier, nn.Linear):
+            # DenseNet121 — classifier is a single Linear
+            in_features = model.classifier.in_features
+            model.classifier = nn.Linear(in_features, num_classes)  # ← replace directly
+        else:
+            # EfficientNet, MobileNet — classifier is Sequential
+            in_features = model.classifier[-1].in_features
+            model.classifier[-1] = nn.Linear(in_features, num_classes)
 
     # ── Load weights (shape-matched) ─────────────────────────────
     dst = model.state_dict()
