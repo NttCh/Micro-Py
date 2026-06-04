@@ -68,13 +68,9 @@ RULE_COLOR = {
     "rule1b":              "#B03030",
     "rule2_neighbor":      "#1A7A8A",
     "rule3_cluster_flag":  "#666666",
-    "rule4_refer":         "#444444",   # canonical name from engine v2
-    "rule1f_mixed":        "#C48A00",
+    "rule4_refer":         "#444444",   
     "rule1a_mixed":        "#C48A00",
-    "rule1f_minority":     "#B03030",
     "rule1b_minority":     "#B03030",
-    "rule2_cluster_flag":  "#666666",
-    # legacy aliases kept so old CSVs still render
     "rule3_review":        "#666666",
     "rule4_review":        "#444444",
 }
@@ -89,11 +85,8 @@ GRID_ROWS = 7
 GRID_COLS = 9
 
 _RULE_ALIAS = {
-    "rule1f_mixed":    "rule1a",
     "rule1a_mixed":    "rule1a",
-    "rule1f_minority": "rule1b",
     "rule1b_minority": "rule1b",
-    # legacy engine names → canonical
     "rule3_review":    "rule3_cluster_flag",
     "rule4_review":    "rule4_refer",
 }
@@ -102,8 +95,7 @@ def _norm_rule(rule: str) -> str:
     return _RULE_ALIAS.get(str(rule), str(rule))
 
 RULE1_NAMES = {"rule1a", "rule1b",
-               "rule1f_mixed", "rule1a_mixed",
-               "rule1f_minority", "rule1b_minority"}
+               "rule1a_mixed","rule1b_minority"}
 
 def _conf_tier_label(conf: float, high_thr: float, low_thr: float = 0.0) -> str:
     """Two-tier: HIGH (H) or LOW (L). low_thr kept as unused arg for call-site compat."""
@@ -531,8 +523,8 @@ def _draw_panel(ax, df_slide, title: str, dc: DrawConfig, mode: str = "after"):
         # Uses dc.window_rows / dc.window_cols — same values that
         # pyreason_engine.py used when it ran the evaluation.
         # fixed — only Rule 1a / 1b get the window border
-        RULE1_CHANGED = {"rule1a", "rule1b", "rule1f_mixed", "rule1a_mixed",
-                        "rule1f_minority", "rule1b_minority"}
+        RULE1_CHANGED = {"rule1a", "rule1b", "rule1a_mixed",
+                        "rule1b_minority"}
         if mode == "before_window" and changed and dc.section_mode == "window" and rule in RULE1_CHANGED:
             ax.add_patch(mpatches.Rectangle(
                 (c - h_c - 0.5, r - h_r - 0.5), W_COLS, W_ROWS,
@@ -820,7 +812,7 @@ def _draw_triage_panel(ax, df_slide, title: str, dc: DrawConfig):
 
         if is_wrong:
             ax.text(c - 0.33, r - 0.33, "X", ha="center", va="center",
-                    fontsize=11, color="#7B0000", zorder=8, **_bold_font)
+                    fontsize=11, color="#FFFFFF", zorder=8, **_bold_font)
 
     all_gcols = df_slide["gcol"].dropna()
     all_grows = df_slide["grow"].dropna()
