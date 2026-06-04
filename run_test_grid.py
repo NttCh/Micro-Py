@@ -1,7 +1,6 @@
 """
 run_test_grid.py
 ================
-Runs PyReason ONLY on grid-eligible patches.
 
 Individual images (no row_col in filename) and sparse-grid slides
 (fewer than MIN_PATCHES_FOR_VOTE patches) are excluded from inference,
@@ -12,11 +11,6 @@ Usage:
 
 Results saved to: OUTPUT_DIR/grid_only/evaluation_results.xlsx
 
-Why use this?
-    run_test.py includes every patch but PyReason never fires on
-    individual/sparse images. The metrics are diluted by patches the
-    system cannot improve. This script gives you the true picture of
-    what PyReason achieves on images it can actually affect.
 """
 
 import os
@@ -37,13 +31,10 @@ from src.evaluate import compute_slide_final, evaluate
 def _resolve_ckpt() -> str:
     if config.CKPT_PATH:
         return config.CKPT_PATH
-    # Auto-find: walk TRAIN_OUTPUT_DIR for newest best_model*.ckpt
-    import glob
-    pattern = os.path.join(config.TRAIN_OUTPUT_DIR, "**", "best_model", "*.ckpt")
-    found = sorted(glob.glob(pattern, recursive=True), reverse=True)
-    if found:
-        print(f"[Auto] Using checkpoint: {found[0]}")
-        return found[0]
+    candidate = os.path.join(config.TRAIN_OUTPUT_DIR, "best_model.ckpt")
+    if os.path.exists(candidate):
+        print(f"[Auto] Using checkpoint: {candidate}")
+        return candidate
     return ""
 
 
@@ -104,10 +95,12 @@ def scan_and_filter(slides_all, image_info_all):
         print("  All images are individual or sparse — cannot run grid-only test.")
         sys.exit(1)
 
-    grid_names     = {n for n in image_info_all
-                      if _image_type(n, image_info_all, slides_all) == "grid"}
-    new_image_info = {n: image_info_all[n] for n in grid_names}
+    # Filter image_info
+    grid_names      = {n for n in image_info_all
+                       if _image_type(n, image_info_all, slides_all) == "grid"}
+    new_image_info  = {n: image_info_all[n] for n in grid_names}
 
+    # Rebuild slides (only slides that still have patches)
     new_slides = defaultdict(list)
     for n in grid_names:
         new_slides[image_info_all[n]["slide_id"]].append(n)
@@ -127,10 +120,11 @@ def main():
     print("(individual + sparse patches excluded from inference)")
     print("=" * 65)
 
+    # ── Validate ─────────────────────────────────────────────────
     ckpt_path = _resolve_ckpt()
     if not ckpt_path or not os.path.exists(ckpt_path):
         print("[ERROR] Checkpoint not found.")
-        print("  Set CKPT_PATH in config.py or run pytrain/main.py first.")
+        print("  Set CKPT_PATH in config.py or run run_train.py first.")
         sys.exit(1)
 
     if not os.path.isdir(config.TEST_FOLDER):
@@ -140,6 +134,7 @@ def main():
     out_dir = os.path.join(config.OUTPUT_DIR, "grid_only")
     os.makedirs(out_dir, exist_ok=True)
 
+    # ── Device + model ───────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n[Device] {device}")
 
@@ -153,27 +148,32 @@ def main():
     model = model.to(device)
     print(f"  num_classes={num_classes}")
 
+    # ── Index ALL images first (needed to classify types correctly) ──
     print(f"\n[Step 2] Indexing test folder: {config.TEST_FOLDER}")
+    # Auto-detect: if any labelled subfolder exists → use subfolders (with GT labels)
+    # Otherwise → flat folder mode (no GT labels, PyReason still runs)
+    import os as _os
     has_subfolders = any(
-        os.path.isdir(os.path.join(config.TEST_FOLDER, sf))
+        _os.path.isdir(_os.path.join(config.TEST_FOLDER, sf))
         for sf in (config.LABELLED_SUBFOLDERS or [])
     )
     if has_subfolders:
         subfolder_names = config.LABELLED_SUBFOLDERS
-        print("  [Mode] Labelled subfolders found → GT labels available")
+        print(f"  [Mode] Labelled subfolders found → GT labels available")
     else:
         subfolder_names = None
-        print("  [Mode] No subfolders found → flat folder, no GT labels")
-        print("  [Mode] PyReason will run; metrics skipped (no ground truth)")
-
+        print(f"  [Mode] No subfolders found → flat folder, no GT labels")
+        print(f"  [Mode] PyReason will run; metrics skipped (no ground truth)")
     slides_all, image_info_all = build_image_index(config.TEST_FOLDER, subfolder_names)
 
     if len(image_info_all) == 0:
-        print("[ERROR] No images found. Check TEST_FOLDER in config.py.")
+        print("[ERROR] No images found. Check TEST_FOLDER.")
         sys.exit(1)
 
+    # ── Scan + filter to grid-only ───────────────────────────────
     slides, image_info = scan_and_filter(slides_all, image_info_all)
 
+    # ── ML inference (grid patches only) ────────────────────────
     print(f"\n[Step 3] Running ML inference on {len(image_info)} grid patches...")
     transform = build_transform(config.IMG_SIZE)
     raw = run_inference(model, image_info, transform, device, num_classes)
@@ -184,14 +184,17 @@ def main():
     print(f"  Confidence     : HIGH={tier_counts['HIGH']}  "
           f"MEDIUM={tier_counts['MEDIUM']}  LOW={tier_counts['LOW']}")
 
+    # ── Slide vote ───────────────────────────────────────────────
     print(f"\n[Step 4] Computing slide votes...")
     slide_vote = compute_slide_vote(slides, raw)
     n_dom = sum(1 for sv in slide_vote.values() if sv["dominant"])
     print(f"  Dominant slides : {n_dom} / {len(slides)}")
 
+    # ── PyReason ─────────────────────────────────────────────────
     print(f"\n[Step 5] Running PyReason...")
     corrections = run_pyreason(slides, raw, image_info, slide_vote)
 
+    # ── Apply ────────────────────────────────────────────────────
     print(f"\n[Step 6] Applying corrections...")
     final = apply_corrections(raw, corrections)
     n_changed = sum(1 for f in final.values() if f["changed"])
@@ -199,16 +202,19 @@ def main():
     print(f"  Changed      : {n_changed}")
     print(f"  Review flags : {n_review}")
 
+    # ── Slide final ──────────────────────────────────────────────
     slide_final = compute_slide_final(slides, final, slide_vote)
 
+    # ── Evaluate ─────────────────────────────────────────────────
     print(f"\n[Step 7] Evaluating (grid patches only)...")
     results = evaluate(
         raw=raw, final=final, image_info=image_info,
         slides=slides, slide_vote=slide_vote,
         slide_final=slide_final, output_dir=out_dir,
-        image_info_all=image_info_all,
+        image_info_all=image_info_all,   # all patches including sparse/individual
     )
 
+    # ── Final verdict ────────────────────────────────────────────
     print(f"\n[Done] Results saved to: {out_dir}")
 
     if results["has_gt"]:
@@ -220,6 +226,8 @@ def main():
         print(f"\n[Verdict] On {results['n_patches']} grid-eligible patches:")
         print(f"  ML F2       : {pm_ml.get('f2', 0):.4f}")
         print(f"  PyReason F2 : {pm_pr.get('f2', 0):.4f}  ({delta_f2:+.4f})  → {verdict}")
+        print(f"\n  These metrics reflect PyReason's true performance —")
+        print(f"  no dilution from individual/sparse patches it cannot affect.")
     else:
         print("[Note] No GT labels — metrics not computed.")
         print("  Add labelled subfolders (pos/ neg/ mixed/) to TEST_FOLDER.")
