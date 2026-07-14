@@ -3,7 +3,12 @@ import pytrain.src._path_fix  # noqa: F401  — ensures repo root is on sys.path
 """Training utilities and main training functions."""
 
 import os
+import re
+import json
+import sys
 import time
+import itertools
+from pathlib import Path
 from typing import List, Optional, Tuple
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import albumentations as A
@@ -155,7 +160,379 @@ def _ensure_cfg_has_backbone(cfg):
         print(f"[Guard] WARNING: could not ensure backbone ({e})")
 
 
-# ---------------- train_stage ----------------
+# ─────────────────────────────────────────────────────────────────────────────
+#  Val sweep helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_filename_for_sweep(filename: str):
+    """
+    Parse slide_id, row, col from a filename stem.
+
+    '000043_2_2.jpg' -> ('000043', 2, 2)     grid patch
+    '000043.jpg'     -> ('000043', None, None) individual
+    'anything_else'  -> ('anything_else', None, None)
+    """
+    stem = Path(filename).stem
+    m = re.match(r"^(\d+)_(\d+)_(\d+)$", stem)
+    if m:
+        return m.group(1), int(m.group(2)), int(m.group(3))
+    m = re.match(r"^(\d+)$", stem)
+    if m:
+        return m.group(1), None, None
+    return stem, None, None
+
+
+@torch.no_grad()
+def _save_val_sweep_csv(
+    model,
+    valid_df: pd.DataFrame,
+    valid_tf,
+    cfg,
+    fold_number: int,
+    int_to_label: dict,
+    image_col: str = "filename",
+    label_col: str = "label",
+):
+    """
+    Run inference on the val fold (best-epoch weights already loaded) and
+    write a patch_results CSV that sweep_thresholds.run_once() can consume.
+
+    Columns written:
+        image_name, slide_id, row, col, subfolder, filename,
+        gt_label, ml_predicted, ml_conf, ml_prob_G, ml_prob_Gplus
+
+    Output: <BASE_SAVE_DIR>/eval/val_patch_results_fold{N}.csv
+    """
+    eval_dir = os.path.join(config.BASE_SAVE_DIR, "eval")
+    os.makedirs(eval_dir, exist_ok=True)
+    out_csv = os.path.join(eval_dir, f"val_patch_results_fold{fold_number}.csv")
+
+    # unwrap LitClassifier -> bare nn.Module if needed
+    device    = next(model.parameters()).device if list(model.parameters()) else torch.device("cpu")
+    raw_model = getattr(model, "model", model)
+    raw_model.eval()
+
+    ds = PatchClassificationDataset(
+        valid_df,
+        cfg.data.folder_path,
+        transforms=valid_tf,
+        image_col=image_col,
+        label_col=label_col,
+    )
+    loader = DataLoader(
+        ds,
+        batch_size=cfg.data.batch_size,
+        shuffle=False,
+        num_workers=cfg.data.num_workers,
+        pin_memory=False,
+        persistent_workers=False,
+    )
+
+    filenames     = ds.df[image_col].tolist()
+    gt_labels_int = ds.df[label_col].tolist()
+
+    all_probs = []
+    for images, _ in loader:
+        images = images.to(device)
+        logits = raw_model(images)
+        probs  = torch.softmax(logits, dim=1).cpu().numpy()
+        all_probs.append(probs)
+
+    if not all_probs:
+        print(f"[SweepCSV] Fold {fold_number}: no val images — skipping.")
+        return
+
+    all_probs = np.concatenate(all_probs, axis=0)   # (N, num_classes)
+    n_classes = all_probs.shape[1]
+
+    rows = []
+    for i, (fn, gt_int) in enumerate(zip(filenames, gt_labels_int)):
+        probs_i      = all_probs[i]
+        best_idx     = int(np.argmax(probs_i))
+        conf         = float(probs_i[best_idx])
+        ml_predicted = int_to_label.get(best_idx, str(best_idx))
+        gt_label     = int_to_label.get(int(gt_int), str(gt_int))
+        slide_id, row, col = _parse_filename_for_sweep(fn)
+
+        rows.append({
+            "image_name":    Path(fn).stem,
+            "slide_id":      slide_id,
+            "row":           row,
+            "col":           col,
+            "subfolder":     gt_label,
+            "filename":      fn,
+            "gt_label":      gt_label,
+            "ml_predicted":  ml_predicted,
+            "ml_conf":       round(conf, 6),
+            "ml_prob_G":     round(float(probs_i[0]), 6) if n_classes > 0 else 0.0,
+            "ml_prob_Gplus": round(float(probs_i[1]), 6) if n_classes > 1 else 0.0,
+        })
+
+    df_out = pd.DataFrame(rows)
+    df_out.to_csv(out_csv, index=False)
+    n_grid = int(df_out["row"].notna().sum())
+    print(
+        f"[SweepCSV] Fold {fold_number}: {len(df_out)} patches "
+        f"({n_grid} grid, {len(df_out) - n_grid} individual) → {out_csv}"
+    )
+
+
+def _write_sweep_skipped(eval_dir: str, reason: str):
+    """Write a marker so downstream code can detect that sweep was skipped."""
+    path = os.path.join(eval_dir, "best_thresholds.json")
+    with open(path, "w") as f:
+        json.dump({"_skipped": True, "_reason": reason}, f, indent=2)
+
+
+def run_val_threshold_sweep(eval_dir: str, n_folds: int):
+    """
+    After all CV folds finish:
+      1. Load val_patch_results_fold*.csv files from eval_dir
+      2. Combine into one DataFrame
+      3. Run the full SWEEP grid (same logic as sweep_thresholds.main)
+      4. Apply staged safety filter
+      5. Write best_thresholds.json to eval_dir
+      6. Write val_threshold_sweep.csv (full ranked results)
+
+    Skips gracefully when:
+      - no fold CSVs exist
+      - no grid patches (individual-only dataset)
+      - sweep_thresholds.py is not importable
+    """
+    fold_csvs = sorted(Path(eval_dir).glob("val_patch_results_fold*.csv"))
+    if not fold_csvs:
+        print("[ValSweep] No fold CSVs found — skipping threshold sweep.")
+        return
+
+    dfs = []
+    for p in fold_csvs:
+        try:
+            dfs.append(pd.read_csv(p))
+        except Exception as e:
+            print(f"[ValSweep] Could not read {p}: {e}")
+
+    if not dfs:
+        print("[ValSweep] All fold CSVs unreadable — skipping.")
+        return
+
+    combined = pd.concat(dfs, ignore_index=True)
+    n_grid   = int(combined["row"].notna().sum())
+    print(
+        f"[ValSweep] Combined {len(fold_csvs)} fold(s): "
+        f"{len(combined)} patches, {n_grid} grid-eligible."
+    )
+
+    if n_grid == 0:
+        print(
+            "[ValSweep] No grid patches found.\n"
+            "  Filenames need the pattern <slide>_<row>_<col>.jpg "
+            "(e.g. 000043_2_2.jpg) for the spatial sweep to work.\n"
+            "  Thresholds in config.py will be used unchanged."
+        )
+        _write_sweep_skipped(eval_dir, reason="no_grid_patches")
+        return
+
+    # save combined CSV for transparency / debugging
+    combined_csv = os.path.join(eval_dir, "val_patch_results_combined.csv")
+    combined.to_csv(combined_csv, index=False)
+
+    # import sweep_thresholds at call-time (not at module load)
+    # Try several candidate locations for the repo root where
+    # sweep_thresholds.py should live alongside config.py.
+    try:
+        import importlib
+        import importlib.util
+
+        # candidate roots: config module location, this file's parents
+        _candidates = []
+        try:
+            import config as _cm
+            _candidates.append(str(Path(_cm.__file__).resolve().parent))
+        except Exception:
+            pass
+        # walk up from this file: pytrain/src/utils/train.py -> repo root is 3 levels up
+        _here = Path(__file__).resolve()
+        for _n in range(1, 5):
+            _candidates.append(str(_here.parents[_n]))
+
+        _sw = None
+        for _root in _candidates:
+            _sweep_path = os.path.join(_root, "sweep_thresholds.py")
+            if os.path.exists(_sweep_path):
+                if _root not in sys.path:
+                    sys.path.insert(0, _root)
+                _spec = importlib.util.spec_from_file_location("sweep_thresholds", _sweep_path)
+                _sw   = importlib.util.module_from_spec(_spec)
+                _spec.loader.exec_module(_sw)
+                print(f"[ValSweep] Loaded sweep_thresholds from: {_sweep_path}")
+                break
+
+        if _sw is None:
+            print(
+                "[ValSweep] sweep_thresholds.py not found in any of:\n"
+                + "\n".join(f"  {r}" for r in _candidates)
+                + "\n  Skipping threshold sweep."
+            )
+            return
+    except Exception as e:
+        print(f"[ValSweep] Could not load sweep_thresholds: {e} — skipping.")
+        return
+
+    # ── baseline metrics (CNN only, no rules) ────────────────────
+    raw_base           = _sw.rebuild_raw(combined)
+    slides, image_info = _sw.rebuild_structures(combined)
+
+    pairs = [
+        (image_info[n].get("gt_label"), raw_base[n]["predicted"])
+        for n in raw_base
+        if image_info[n].get("gt_label") is not None
+    ]
+    if not pairs:
+        print("[ValSweep] No GT labels in combined val data — skipping.")
+        return
+
+    baseline = _sw._metrics([p[0] for p in pairs], [p[1] for p in pairs])
+    print(
+        f"[ValSweep] Val baseline  MCC={baseline['mcc']:.4f}  "
+        f"Coverage={baseline['coverage']:.1%}  Deferred={baseline['n_deferred']}"
+    )
+
+    # ── full sweep grid ───────────────────────────────────────────
+    keys   = list(_sw.SWEEP.keys())
+    combos = list(itertools.product(*_sw.SWEEP.values()))
+    print(f"[ValSweep] Testing {len(combos)} threshold combinations ...")
+
+    rows_out = []
+    for combo in combos:
+        params = dict(zip(keys, combo))
+        try:
+            m = _sw.run_once(
+                raw_base, slides, image_info,
+                high_thr               = params["HIGH_CONF_THR"],
+                nb_min                 = params["NEIGHBOR_AGREE_MIN"],
+                section_mode           = params["SECTION_MODE"],
+                section_ratio_thr      = params["SECTION_MAJORITY_RATIO_THR"],
+                section_min_patches    = params["SECTION_MIN_PATCHES"],
+                n_sections             = params["N_SECTIONS"],
+                window_rows            = params["WINDOW_ROWS"],
+                window_cols            = params["WINDOW_COLS"],
+                anchor_conf_thr        = params["ANCHOR_CONF_THR"],
+                section_minority_min   = params["SECTION_MINORITY_MIN_PATCHES"],
+                section_minority_ratio = params["SECTION_MINORITY_RATIO_THR"],
+                section_max_mixed_frac = params["SECTION_MAX_MIXED_FRACTION"],
+            )
+        except Exception as _run_e:
+            # print first failure so we can diagnose, then skip that combo
+            if not rows_out:
+                print(f"[ValSweep] run_once error (first combo shown): {_run_e}")
+            continue
+        rows_out.append({
+            **params, **m,
+            "delta_mcc": m["mcc"] - baseline["mcc"],
+        })
+
+    if not rows_out:
+        print("[ValSweep] No sweep results produced — skipping.")
+        return
+
+    result_df = (
+        pd.DataFrame(rows_out)
+        .sort_values(
+            ["n_tier1_errors", "n_worsened", "n_unflagged",
+             "mcc", "commit_accuracy", "coverage", "n_r1b"],
+            ascending=[True, True, True, False, False, False, False],
+        )
+        .reset_index(drop=True)
+    )
+    result_df.insert(0, "rank", result_df.index + 1)
+
+    # ── staged safety filter (mirrors sweep_thresholds.main) ─────
+    safe_df = pd.DataFrame()
+    found   = False
+    for t1e in _sw.SAFETY_TIER1_ERRORS_RANGE:
+        g1 = result_df[result_df["n_tier1_errors"] <= t1e]
+        if not len(g1):
+            continue
+        for wor in _sw.SAFETY_WORSENED_RANGE:
+            g2 = g1[g1["n_worsened"] <= wor]
+            if not len(g2):
+                continue
+            for unflg in _sw.SAFETY_UNFLAGGED_RANGE:
+                g3 = g2[g2["n_unflagged"] <= unflg]
+                if not len(g3):
+                    continue
+                for cmt in _sw.SAFETY_COMMIT_ACC_RANGE:
+                    g4 = g3[g3["commit_accuracy"] >= cmt].copy()
+                    if not len(g4):
+                        continue
+                    safe_df = g4
+                    found   = True
+                    break
+                if found:
+                    break
+            if found:
+                break
+        if found:
+            break
+
+    if found:
+        best_row = safe_df.iloc[0]
+    else:
+        print("[ValSweep] No safe config found — using best overall.")
+        best_row = result_df.iloc[0]
+
+    # ── save full sweep CSV ───────────────────────────────────────
+    result_df.to_csv(
+        os.path.join(eval_dir, "val_threshold_sweep.csv"), index=False
+    )
+
+    # ── build and save best_thresholds.json ──────────────────────
+    THRESH_KEYS = [
+        "SECTION_MODE",
+        "HIGH_CONF_THR",
+        "ANCHOR_CONF_THR",
+        "SECTION_MAJORITY_RATIO_THR",
+        "SECTION_MIN_PATCHES",
+        "N_SECTIONS",
+        "WINDOW_ROWS",
+        "WINDOW_COLS",
+        "NEIGHBOR_AGREE_MIN",
+        "SECTION_MINORITY_MIN_PATCHES",
+        "SECTION_MINORITY_RATIO_THR",
+        "SECTION_MAX_MIXED_FRACTION",
+    ]
+    best_thresholds = {}
+    for k in THRESH_KEYS:
+        v = best_row.get(k)
+        if v is not None:
+            best_thresholds[k] = v.item() if hasattr(v, "item") else v
+
+    best_thresholds["_val_mcc"]         = float(best_row["mcc"])
+    best_thresholds["_val_n_worsened"]  = int(best_row["n_worsened"])
+    best_thresholds["_baseline_mcc"]    = float(baseline["mcc"])
+    best_thresholds["_delta_mcc"]       = float(best_row["mcc"] - baseline["mcc"])
+    best_thresholds["_n_folds_used"]    = n_folds
+    best_thresholds["_n_grid_patches"]  = n_grid
+
+    json_path = os.path.join(eval_dir, "best_thresholds.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(best_thresholds, f, indent=2, ensure_ascii=False)
+
+    print(
+        f"[ValSweep] ✓ Saved → {json_path}\n"
+        f"  MCC={best_thresholds['_val_mcc']:.4f}  "
+        f"Δ={best_thresholds['_delta_mcc']:+.4f}  "
+        f"worsened={best_thresholds['_val_n_worsened']}  "
+        f"HIGH_CONF={best_thresholds['HIGH_CONF_THR']}  "
+        f"ANCHOR={best_thresholds['ANCHOR_CONF_THR']}  "
+        f"MINOR_RATIO={best_thresholds['SECTION_MINORITY_RATIO_THR']:.2f}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  train_stage
+# ─────────────────────────────────────────────────────────────────────────────
+
 def train_stage(
     cfg,
     csv_path: str,
@@ -230,8 +607,6 @@ def train_stage(
     # Class weights computed after the mixed-cap block below.
 
     # ── Mixed-class cap ──────────────────────────────────────────────────────
-    # cfg.data.mixed_cap_ratio (default None = no cap).
-    # mixed label is 2 (index 2 in the 3-class scheme).
     mixed_cap_ratio = getattr(cfg.data, "mixed_cap_ratio", None)
     MIXED_LABEL = 2
     if mixed_cap_ratio is not None:
@@ -255,7 +630,7 @@ def train_stage(
         except Exception as e:
             print(f"[MixedCap] WARNING: could not apply mixed_cap_ratio ({e})")
 
-    # Recompute class weights after cap so sampler reflects the actual distribution
+    # Recompute class weights after cap
     y_train = train_df[cfg.data.label_col].astype(int).to_numpy()
     counts  = np.bincount(y_train, minlength=int(num_classes)).astype(np.float32)
     counts  = np.maximum(counts, 1.0)
@@ -264,15 +639,11 @@ def train_stage(
     print(f"[Balance] post-cap train counts={counts.tolist()} class_w(auto)={class_w.tolist()}")
 
     # ── cfg.training.class_weights override ─────────────────────────────────
-    # If set in config (e.g. [1.0, 1.0, 2.5]), use those values for the LOSS
-    # instead of the auto-computed inverse-frequency weights.
-    # The sampler still uses auto class_w to ensure balanced mini-batches.
     cfg_loss_weights = getattr(cfg.training, "class_weights", None)
     if cfg_loss_weights is not None:
         try:
             override_w = np.array(list(cfg_loss_weights), dtype=np.float32)
             if len(override_w) == num_classes:
-                # Normalise so weights sum to num_classes (same scale as auto weights)
                 override_w = override_w * (num_classes / override_w.sum())
                 print(f"[Balance] Using cfg.training.class_weights for LOSS: {override_w.tolist()}")
                 loss_class_w = override_w
@@ -326,7 +697,7 @@ def train_stage(
         def ok(p):
             return isinstance(p, str) and p.strip() and p.strip().lower() != "none"
 
-        if x is None:         return []
+        if x is None:          return []
         if isinstance(x, seq): return [p for p in x if ok(p)]
         if isinstance(x, str): return [x] if ok(x) else []
         return []
@@ -418,7 +789,7 @@ def train_stage(
     es_enabled = bool(getattr(es_cfg, "enabled", True)) if es_cfg else True
 
     core_callbacks = [
-        FreezeBackboneCallback(cfg),   # honours freeze_strategy / freeze_backbone_epochs
+        FreezeBackboneCallback(cfg),
         OverallProgressCallback(),
         TrialFoldProgressCallback(
             trial_number=trial_number,
@@ -454,7 +825,7 @@ def train_stage(
             )
         )
 
-    n_train_batches  = len(train_loader)
+    n_train_batches   = len(train_loader)
     log_every_n_steps = max(1, min(50, n_train_batches))
     trainer = Trainer(
         max_epochs=max_epochs,
@@ -541,12 +912,30 @@ def train_stage(
             epochs_run=int(epochs_run),
             train_time_sec=float(train_time_sec),
             peak_gpu_mb=float(res_logger.peak_gpu_mb or 0.0),
-            val_score=None if score is None else float(score),  # renamed from val_f2; holds whatever monitor_metric is
+            val_score=None if score is None else float(score),
         )
 
         append_resource_log(row, eval_dir)
     except Exception as e:
         print(f"[Resource] WARNING: could not log resources ({e})")
+
+    # ── save val predictions in sweep-compatible format ───────────────────────
+    # Only during real training (not HPO tune) and only for named CV folds.
+    # Best-epoch weights are already loaded above, so inference here uses them.
+    if not is_tune and not suppress_artifacts and fold_number is not None:
+        try:
+            _save_val_sweep_csv(
+                model        = lit_model,
+                valid_df     = valid_df,
+                valid_tf     = valid_tf,
+                cfg          = cfg,
+                fold_number  = fold_number,
+                int_to_label = {0: "G", 1: "Gplus", 2: "Mixed"},
+                image_col    = getattr(cfg.data, "image_col", "filename"),
+                label_col    = cfg.data.label_col,
+            )
+        except Exception as _sw_e:
+            print(f"[SweepCSV] WARNING: could not save val sweep CSV ({_sw_e})")
 
     cleanup_cuda(
         logger=logger if logger else None,
@@ -558,7 +947,10 @@ def train_stage(
     return lit_model, float(score if score is not None else 0.0)
 
 
-# ---------------- train_with_cross_validation ----------------
+# ─────────────────────────────────────────────────────────────────────────────
+#  train_with_cross_validation
+# ─────────────────────────────────────────────────────────────────────────────
+
 def train_with_cross_validation(
     cfg,
     csv_path: str,
@@ -608,15 +1000,7 @@ def train_with_cross_validation(
             raise ValueError(f"cfg.training.only_fold={only_fold} is out of range (1..{int(cfg.training.num_folds)})")
         print(f"[CV] only_fold enabled → running ONLY fold {only_fold}/{int(cfg.training.num_folds)}")
 
-    # ── Trial-level early stopping (Optuna tuning only) ────────────────────
-    # If a fold scores below min_fold_score, the entire trial is abandoned
-    # immediately — skipping the remaining folds. This saves significant time
-    # during HPO without affecting normal training (trial=None).
-    #
-    # Configure via cfg.training.min_fold_score (default 0.0 = disabled).
-    # Recommended: 0.55–0.65 for val_mcc so only clearly bad trials are pruned.
-    # Set to 0.0 or None in cfg to disable entirely.
-    _is_tuning = trial is not None
+    _is_tuning      = trial is not None
     _min_fold_score = 0.0
     if _is_tuning:
         try:
@@ -655,7 +1039,7 @@ def train_with_cross_validation(
         fold_scores.append(float(val_metric))
         fold_models.append(lit_model)
 
-        # ── Fold-score gate: prune trial if this fold is clearly bad ────────
+        # ── Fold-score gate ───────────────────────────────────────
         if _is_tuning and _min_fold_score > 0.0:
             remaining = int(cfg.training.num_folds) - fold_num
             if val_metric < _min_fold_score and remaining > 0:
@@ -666,7 +1050,6 @@ def train_with_cross_validation(
                     f"pruning trial (skipping {remaining} remaining fold(s), "
                     f"mean so far={mean_so_far:.4f})"
                 )
-                # Report partial mean to Optuna so pruning history is meaningful
                 try:
                     trial.report(mean_so_far, step=fold_num)
                 except Exception:
@@ -689,10 +1072,26 @@ def train_with_cross_validation(
     std_score = float(np.std(fold_scores, ddof=1)) if len(fold_scores) > 1 else 0.0
     print(f"[CV] {len(fold_scores)} fold(s) mean±std({monitor_metric}) = {mean_score:.4f} ± {std_score:.4f}")
 
+    # ── threshold sweep on accumulated val CSVs (real training only) ─────────
+    # trial is None means we are in a real training run, not Optuna HPO.
+    # Sweep reads val_patch_results_fold*.csv written by _save_val_sweep_csv
+    # inside each train_stage call above.
+    if trial is None:
+        try:
+            run_val_threshold_sweep(
+                eval_dir = os.path.join(config.BASE_SAVE_DIR, "eval"),
+                n_folds  = len(fold_scores),
+            )
+        except Exception as _sw_e:
+            print(f"[ValSweep] WARNING: threshold sweep failed ({_sw_e})")
+
     return fold_models[best_idx], mean_score, fold_scores
 
 
-# ---------------- repeated_cross_validation ----------------
+# ─────────────────────────────────────────────────────────────────────────────
+#  repeated_cross_validation
+# ─────────────────────────────────────────────────────────────────────────────
+
 def repeated_cross_validation(
     cfg,
     csv_path: str,
@@ -705,14 +1104,14 @@ def repeated_cross_validation(
     monitor_metric = getattr(getattr(cfg, "training", {}), "early_stop_metric", "val_mcc")
     base_seed      = int(cfg.training.seed)
 
-    repeat_means: List[float]          = []
+    repeat_means: List[float]           = []
     repeat_models: List["LitClassifier"] = []
 
     for r in range(int(repeats)):
         local_seed = base_seed + r
         set_seed(local_seed)
 
-        prev_cfg_seed    = int(cfg.training.seed)
+        prev_cfg_seed     = int(cfg.training.seed)
         cfg.training.seed = local_seed
         try:
             print(f"\n=== Repeated CV run {r+1}/{repeats} (seed={local_seed}) — optimizing {monitor_metric} ===")
@@ -745,7 +1144,10 @@ def repeated_cross_validation(
     return repeat_models[best_idx], mean_over_repeats
 
 
-# ---------------- optuna progress print ----------------
+# ─────────────────────────────────────────────────────────────────────────────
+#  optuna progress print
+# ─────────────────────────────────────────────────────────────────────────────
+
 def print_trial_thai_callback(study, trial) -> None:
     """Optuna callback: print best value & Thai timestamp on completion."""
     if trial.state == optuna.trial.TrialState.COMPLETE:
