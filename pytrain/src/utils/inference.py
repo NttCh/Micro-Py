@@ -24,7 +24,6 @@ from .utils import (
     load_weights_into_model,
 )
 from .viz import save_confusion_matrix
-from .xai import _maybe_run_xai
 from src.model.model import _build_model_for_weights
 
 
@@ -648,17 +647,6 @@ def _run_multi_ckpt_tests(base_model, cfg, dirs, best_ckpt_path: str):
             ckpt_print_prefix=f"[{ckpt_name}] ",
         )
         all_results_for_compare[ckpt_name] = results_dict
-
-        # XAI per folder, namespaced by ckpt_name (prevents overwrites)
-        for folder in test_folds:
-            _maybe_run_xai(
-                model,
-                valid_tf,
-                folder,
-                dirs,
-                getattr(cfg, "xai", None) or {},
-                ckpt_tag=ckpt_name,
-            )
 
     if len(all_results_for_compare) > 1:
         compare_xlsx = os.path.join(
