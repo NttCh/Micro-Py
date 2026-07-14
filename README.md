@@ -7,10 +7,11 @@ CNN-based gram-stain classification with PyReason post-processing.
 ```
 ├── config.py                 ← SINGLE config for the whole pipeline (edit this)
 │
-├── run_test_grid.py          ← Run PyReason on grid-eligible test patches
+├── run_val_sweep.py          ← Tune rule thresholds using validation-fold results
+├── run_test_grid.py          ← Run rule-based engine on grid-eligible test patches
 ├── visualize_slides.py       ← Draw before/after slide grids
 │
-├── src/                      ← PyReason components
+├── src/                      ← Rule-based components
 │   ├── ml_inference.py       ← Load images, run CNN, return raw predictions
 │   ├── model_loader.py       ← Build backbone + load Lightning checkpoint
 │   ├── pyreason_engine.py    ← Rule engine (Rules 1a/1b, 2, 3, 4)
