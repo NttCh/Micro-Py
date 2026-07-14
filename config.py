@@ -202,11 +202,7 @@ SECTION_MINORITY_RATIO_THR    = 0.85
 
 # Rule 0 (Anchor) + Rule 5 (Stronghold)
 # ANCHOR_CONF_THR: patches with confidence >= this are immutable in Rule 1.
-ANCHOR_CONF_THR  = HIGH_CONF_THR   # same as HIGH_CONF_THR by default
-
-# STRONGHOLD_MIN: patch with >= this many HIGH-conf same-class neighbours
-# is a "stronghold" and cannot be flipped by Rule 1, even if LOW/MEDIUM conf.
-STRONGHOLD_MIN   = 2
+ANCHOR_CONF_THR  = 0.80   # same as HIGH_CONF_THR by default
 
 # Sweep compatibility
 NEIGHBOUR_VOTE_MIN      = 2
